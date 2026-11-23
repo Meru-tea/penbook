@@ -27,7 +27,7 @@ const AUTO_SHAPE_MOVE_THRESHOLD=8;
 type Tool='pen'|'eraser'|'lasso'|'shape'|'text'|'sticky'|'link'|'table'|'hand'|'laser'|'tape';
 interface Surface {page:Page;sheet:HTMLElement;bg:HTMLCanvasElement;ink:HTMLCanvasElement;ui:HTMLCanvasElement;text:HTMLElement;epoch:number;visible?:boolean;backgroundReady?:boolean;controller?:AbortController;paintVersion?:number;images?:Map<string,HTMLImageElement>;}
 interface SelectionFrame {cx:number;cy:number;w:number;h:number;angle:number;}
-interface Gesture {pointer:number;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;lastMoved?:number;holdPoint?:Point;snapped?:Item;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
+interface Gesture {pointer:number;pointerType?:string;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;lastMoved?:number;holdPoint?:Point;snapped?:Item;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
 
 export class PenbookView extends TextFileView {
   book:Notebook=newBook();index=0;valid=false;raw='';
@@ -270,7 +270,7 @@ export class PenbookView extends TextFileView {
       const paint=()=>void this.run(async()=>{if(epoch!==this.renderEpoch||s.visible)return;s.visible=true;const controller=new AbortController();s.controller=controller;for(const c of[bg,ink,ui]){c.width=Math.max(1,Math.round(p.width*scale));c.height=Math.max(1,Math.round(p.height*scale));}await this.pdfs.background(bg,p,this.book,this.renderer,scale,controller.signal);if(epoch!==this.renderEpoch||controller.signal.aborted)return;s.backgroundReady=true;await this.paint(s);if(this.reading&&p.background&&this.book.resources[p.background.resource]?.type==='pdf')await this.pdfTextLayer(s);});
       if(p.id===this.page.id||this.layout!=='continuous')paint();
       if(observer){loaders.set(sheet,{surface:s,paint});observer.observe(sheet);}
-      ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{if(this.gesture?.pointer===e.pointerId&&!this.gesture.ending)this.finishGesture(false);});
+      ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
       ui.addEventListener('contextmenu',e=>{e.preventDefault();this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
       let press:{x:number;y:number}|undefined;
       ui.addEventListener('pointerdown',e=>press={x:e.clientX,y:e.clientY});
@@ -393,16 +393,16 @@ export class PenbookView extends TextFileView {
     if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;}
     if(e.pointerType==='touch'&&(Date.now()-this.lastPen<700||this.gesture?.pointer!==undefined&&this.gesture.tool!=='hand'))return;
     const textPlacement=!this.reading&&(this.tool==='sticky'||this.tool==='text');
-    if(!textPlacement)e.preventDefault();s.ui.setPointerCapture(e.pointerId);this.activate(s);if(!textPlacement)this.root.focus({preventScroll:true});
+    e.preventDefault();s.ui.setPointerCapture(e.pointerId);this.activate(s);if(!textPlacement)this.root.focus({preventScroll:true});
     if(e.pointerType==='touch'&&(!this.fingerInk||this.reading||this.tool==='hand')){this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});if(this.touches.size===2){const[a,b]=[...this.touches.values()];this.pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),zoom:this.zoom,cx:(a.x+b.x)/2,cy:(a.y+b.y)/2};}return;}
-    if(this.gesture)return;const pt=this.point(e,s);let tool=this.reading?'hand':this.tool;if(e.pointerType==='pen'&&(e.button===5||(e.buttons&32)!==0||e.button===2))tool='eraser';
+    if(this.gesture){if(this.gesture.pointerType===e.pointerType)return;this.finishGesture(true);}const pt=this.point(e,s);let tool=this.reading?'hand':this.tool;if(e.pointerType==='pen'&&(e.button===5||(e.buttons&32)!==0||e.button===2))tool='eraser';
     if(this.sampleColor){this.sampleColor=false;const canvas=document.createElement('canvas');canvas.width=canvas.height=1;const ctx=canvas.getContext('2d')!;for(const layer of[s.bg,s.ink])ctx.drawImage(layer,pt[0]*layer.width/s.page.width,pt[1]*layer.height/s.page.height,1,1,0,0,1,1);const c=ctx.getImageData(0,0,1,1).data;this.chooseColor('#'+[c[0],c[1],c[2]].map(n=>n.toString(16).padStart(2,'0')).join(''));this.drawContext();return;}
     const frame=tool==='lasso'?this.selectionFrame():null,selectionHit=frame?this.selectionHit(pt,frame):undefined;
     const tape=[...s.page.items].reverse().find(o=>o.kind==='tape'&&contains(o,pt[0],pt[1]));if(tape&&['hand','lasso'].includes(tool)&&!selectionHit){const before=this.snapshot();tape.revealed=!tape.revealed;this.changed(before);this.repaint();return;}
     if(s.page.locked&&!['hand','laser'].includes(tool)){new Notice('页面已锁定，请在更多中解锁');return;}
     if(this.reading){const o=[...s.page.items].reverse().find(o=>o.kind==='link'&&contains(o,pt[0],pt[1]));if(o){void this.run(()=>this.openLink(o.target??''));return;}}
     if(['text','link','table'].includes(tool)){void this.run(()=>this.insertObject(tool as 'text'|'link'|'table',pt));return;}
-    const before=['hand','laser','sticky'].includes(tool)?undefined:this.snapshot();this.gesture={pointer:e.pointerId,surface:s,tool,points:[pt],start:pt,last:pt,lastMoved:performance.now(),before,eraseSession:tool==='eraser'?uid():undefined,erasedStrokes:tool==='eraser'?new Set():undefined,eraseOutlines:tool==='eraser'?new Map():undefined};
+    const before=['hand','laser','sticky'].includes(tool)?undefined:this.snapshot();this.gesture={pointer:e.pointerId,pointerType:e.pointerType,surface:s,tool,points:[pt],start:pt,last:pt,lastMoved:performance.now(),before,eraseSession:tool==='eraser'?uid():undefined,erasedStrokes:tool==='eraser'?new Set():undefined,eraseOutlines:tool==='eraser'?new Map():undefined};
     if(tool==='lasso'){
       if(frame&&selectionHit){this.gesture.mode=selectionHit;this.gesture.frame=frame;this.gesture.original=clone(this.page.items.filter(o=>this.selection.has(o.id)&&!o.locked));}
       else this.paintUI(s);
@@ -424,7 +424,7 @@ export class PenbookView extends TextFileView {
     if(g.mode&&g.original&&g.frame){const dx=pt[0]-g.start[0],dy=pt[1]-g.start[1],f=g.frame,c=Math.cos(f.angle),s=Math.sin(f.angle),start=this.framePoint(g.start,f),p=this.framePoint(pt,f);
       const scaleX=Math.max(.05,Math.min(20,1+(p.x-start.x)/Math.max(1,f.w))),scaleY=Math.max(.05,Math.min(20,1+(p.y-start.y)/Math.max(1,f.h))),a=Math.atan2(pt[1]-f.cy,pt[0]-f.cx)-Math.atan2(g.start[1]-f.cy,g.start[0]-f.cx),anchorX=f.cx-f.w/2*c+f.h/2*s,anchorY=f.cy-f.w/2*s-f.h/2*c;
       if(g.mode==='rotate')this.selectionAngle=f.angle+a;
-      for(const original of g.original){const o=this.page.items.find(o=>o.id===original.id)!;if(g.mode==='move'){o.x=original.x+dx;o.y=original.y+dy;}else if(g.mode==='rotate'){const x=original.x+original.w/2-f.cx,y=original.y+original.h/2-f.cy;o.x=f.cx+x*Math.cos(a)-y*Math.sin(a)-original.w/2;o.y=f.cy+x*Math.sin(a)+y*Math.cos(a)-original.h/2;o.rotation=original.rotation+a*180/Math.PI;}else{const centerX=original.x+original.w/2-anchorX,centerY=original.y+original.h/2-anchorY,localX=centerX*c+centerY*s,localY=-centerX*s+centerY*c,oW=original.w*scaleX,oH=original.h*scaleY,scaledX=localX*scaleX,scaledY=localY*scaleY;o.w=oW;o.h=oH;o.x=anchorX+scaledX*c-scaledY*s-o.w/2;o.y=anchorY+scaledX*s+scaledY*c-o.h/2;if(original.kind==='shape'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.bw=o.w;o.bh=o.h;}else if(original.kind==='stroke'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.frozenInk=original.frozenInk?.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY]));o.eraseMasks=original.eraseMasks?.map(poly=>poly.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY])));o.bw=o.w;o.bh=o.h;}else if(original.kind==='sticky'||original.kind==='text'){o.bw=o.w;o.bh=o.h;}}}
+      for(const original of g.original){const o=g.surface.page.items.find(o=>o.id===original.id)!;if(g.mode==='move'){o.x=original.x+dx;o.y=original.y+dy;}else if(g.mode==='rotate'){const x=original.x+original.w/2-f.cx,y=original.y+original.h/2-f.cy;o.x=f.cx+x*Math.cos(a)-y*Math.sin(a)-original.w/2;o.y=f.cy+x*Math.sin(a)+y*Math.cos(a)-original.h/2;o.rotation=original.rotation+a*180/Math.PI;}else{const centerX=original.x+original.w/2-anchorX,centerY=original.y+original.h/2-anchorY,localX=centerX*c+centerY*s,localY=-centerX*s+centerY*c,oW=original.w*scaleX,oH=original.h*scaleY,scaledX=localX*scaleX,scaledY=localY*scaleY;o.w=oW;o.h=oH;o.x=anchorX+scaledX*c-scaledY*s-o.w/2;o.y=anchorY+scaledX*s+scaledY*c-o.h/2;if(original.kind==='shape'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.bw=o.w;o.bh=o.h;}else if(original.kind==='stroke'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.frozenInk=original.frozenInk?.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY]));o.eraseMasks=original.eraseMasks?.map(poly=>poly.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY])));o.bw=o.w;o.bh=o.h;}else if(original.kind==='sticky'||original.kind==='text'){o.bw=o.w;o.bh=o.h;}}}
       g.last=pt;this.repaint();return;
     }
     if(g.tool==='laser'){this.laserPoint(g.surface,pt);}
@@ -442,7 +442,7 @@ export class PenbookView extends TextFileView {
     if(this.touches.has(e.pointerId)){this.touches.delete(e.pointerId);if(this.touches.size<2)this.pinch=undefined;if(!this.touches.size){this.drawPages();this.drawFooter();}return;}
     if(this.gesture?.pointer===e.pointerId){const g=this.gesture;const end=this.point(e,g.surface);if(g.tool==='eraser'&&!g.ending)this.queueErase(g,g.last,end);g.last=end;if(g.tool==='pen'&&Math.hypot(end[0]-g.points.at(-1)![0],end[1]-g.points.at(-1)![1])>.2)g.points.push(end);this.finishGesture(true);}
   }
-  private pointerCancel(e:PointerEvent){this.touches.delete(e.pointerId);this.pinch=undefined;if(this.gesture?.pointer===e.pointerId)this.finishGesture(false);}
+  private pointerCancel(e:PointerEvent){this.touches.delete(e.pointerId);this.pinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
   private finishGesture(commit:boolean):void|Promise<void>{
     const current=this.gesture;
     if(current?.tool==='eraser'&&!current.finalized&&commit){return current.ending??(current.ending=this.finishEraser(current));}
@@ -456,7 +456,7 @@ export class PenbookView extends TextFileView {
     else if(g.tool==='sticky'){this.hover=undefined;this.paintUI(g.surface);void this.run(()=>this.insertObject('sticky',g.last));return;}
     else if(g.tool==='shape'&&g.points.length>1&&this.automaticShape){g.surface.page.items.push(g.snapped??this.autoShape(g)??this.inkStroke(g.points));edited=true;}
     else if(g.tool==='shape'&&!this.automaticShape&&Math.hypot(g.last[0]-g.start[0],g.last[1]-g.start[1])>2){g.surface.page.items.push(this.makeShape(g.start,g.last,g.lastMoved));edited=true;}
-    else if(g.mode){edited=Math.hypot(g.last[0]-g.start[0],g.last[1]-g.start[1])>.1;}
+    else if(g.mode){edited=Boolean(g.original?.some(b=>{const o=g.surface.page.items.find(x=>x.id===b.id);return o&&(Math.abs(o.x-b.x)>1e-3||Math.abs(o.y-b.y)>1e-3||Math.abs(o.w-b.w)>1e-3||Math.abs(o.h-b.h)>1e-3);}));}
     else if(g.tool==='eraser'){edited=Boolean(g.edited);}
     else if(g.tool==='lasso'){
       this.selection=new Set();

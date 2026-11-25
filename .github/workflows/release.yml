@@ -1,0 +1,71 @@
+name: Build and Upload Release Assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已有 Release 的 Tag（例如 0.3.3）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine target tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies and build
+        run: |
+          npm ci
+          npm run build
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.package ? 0 : 1)"; then
+            npm run package
+          fi
+
+      - name: Collect release assets
+        run: |
+          mkdir -p dist-assets
+
+          for f in main.js manifest.json styles.css; do
+            if [ -f "release/penbook/$f" ]; then
+              cp "release/penbook/$f" "dist-assets/$f"
+            elif [ -f "$f" ]; then
+              cp "$f" "dist-assets/$f"
+            fi
+          done
+
+          if [ -d "release/penbook" ]; then
+            (cd release && zip -r ../dist-assets/penbook.zip penbook)
+          fi
+
+          ls -lh dist-assets
+
+      - name: Upload assets to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          gh release upload "$TAG" dist-assets/* --clobber

@@ -50,6 +50,7 @@ export class PenbookView extends TextFileView {
   private hover?:{surface:Surface;point:Point};
   private eraserCursorRects=new WeakMap<Surface,{x:number;y:number;w:number;h:number}>();
   private backgroundEraser=new BackgroundEraser();
+  private penEraserBefore?:Tool;private penHoldTimer?:number;private penHoldStart?:Point;private penHoldFired=false;private lastPointerType?:string;
   private snapshots=new SnapshotStore();
   private lastWritten?:string;
   private thumbsController?:AbortController;
@@ -108,7 +109,10 @@ export class PenbookView extends TextFileView {
   private async flush(){if(!this.valid||!this.dirty||!this.file){await this.saving;return;}if(this.saveTimer)window.clearTimeout(this.saveTimer);this.saveTimer=undefined;
     if(this.gesture){this.saveTimer=window.setTimeout(()=>void this.flush(),650);return;}
     const file=this.file, data=this.getViewData();this.lastWritten=data;this.raw=data;this.dirty=false;
-    this.saving=this.saving.catch(()=>{}).then(async()=>{await this.app.vault.modify(file,data);});
+    this.saving=this.saving.catch(()=>{}).then(async()=>{
+      try{JSON.parse(data);}catch(error){throw new Error('笔记本数据校验失败，已放弃本次写入');}
+      await this.app.vault.modify(file,data);
+    });
     try{await this.saving;}catch(error){this.dirty=true;new Notice('保存失败，请保持笔记本打开并检查存储空间。');console.error(error);}
   }
   get page(){return this.book.pages[this.index];}
@@ -271,7 +275,7 @@ export class PenbookView extends TextFileView {
       if(p.id===this.page.id||this.layout!=='continuous')paint();
       if(observer){loaders.set(sheet,{surface:s,paint});observer.observe(sheet);}
       ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
-      ui.addEventListener('contextmenu',e=>{e.preventDefault();this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
+      ui.addEventListener('contextmenu',e=>{e.preventDefault();if(this.lastPointerType==='pen'||this.penHoldFired){this.penHoldFired=false;return;}this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
       let press:{x:number;y:number}|undefined;
       ui.addEventListener('pointerdown',e=>press={x:e.clientX,y:e.clientY});
       ui.addEventListener('click',e=>{if(this.inlineEditor){e.stopPropagation();queueMicrotask(()=>document.querySelector<HTMLElement>('.pb-inline-text')?.focus({preventScroll:true}));return;}if(press&&(this.reading||this.tool==='hand')&&Math.hypot(e.clientX-press.x,e.clientY-press.y)<6){const point=this.point(e,s),link=p.pdfLinks?.find(l=>point[0]>=l.x&&point[0]<=l.x+l.w&&point[1]>=l.y&&point[1]<=l.y+l.h);if(link)void this.run(()=>link.page?Promise.resolve(this.goToId(link.page)):this.openLink(link.url??''));}});
@@ -390,6 +394,7 @@ export class PenbookView extends TextFileView {
   private pointerDown(e:PointerEvent,s:Surface){
     if(!this.valid||e.pointerType==='pen'&&!this.plugin.settings.penEnabled)return;
     rememberAnchor(null);
+    this.lastPointerType=e.pointerType;
     if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;}
     if(e.pointerType==='touch'&&(Date.now()-this.lastPen<700||this.gesture?.pointer!==undefined&&this.gesture.tool!=='hand'))return;
     const textPlacement=!this.reading&&(this.tool==='sticky'||this.tool==='text');
@@ -409,6 +414,50 @@ export class PenbookView extends TextFileView {
     }
     if(tool==='eraser'){this.queueErase(this.gesture,pt,pt);this.paintUI(s,undefined,undefined,pt);}
     if(tool==='laser')this.laserPoint(s,pt,true);
+    if(e.pointerType==='pen'&&['pen','shape'].includes(tool))this.startPenHold(pt);
+  }
+  private startPenHold(pt:Point){
+    this.cancelPenHold();
+    const start:Point=[pt[0],pt[1],pt[2]];
+    this.penHoldStart=start;this.penHoldFired=false;
+    this.penHoldTimer=window.setTimeout(()=>{
+      this.penHoldTimer=undefined;
+      const g=this.gesture,from=this.penHoldStart;
+      if(!g||!from||g.ending)return;
+      if(Math.hypot(g.last[0]-from[0],g.last[1]-from[1])>8/this.zoom)return;
+      this.penHoldFired=true;
+      this.penEraserBefore=this.tool;
+      // 把当前这一笔原地转为橡皮擦手势，抬笔前即可直接擦除
+      g.tool='eraser';g.points=[from];g.start=from;g.last=from;
+      g.eraseSession=uid();g.erasedStrokes=new Set();g.eraseOutlines=new Map();g.eraseQueue=[];g.edited=false;
+      this.tool='eraser';this.reading=false;
+      for(const[t,b]of this.penButtons){b.toggleClass('is-active',t==='eraser');b.setAttribute('aria-pressed',String(t==='eraser'));}
+      this.drawContext();this.drawFooter();
+      this.queueErase(g,from,from);
+      this.paintUI(g.surface,undefined,undefined,from);
+      new Notice('已切换为橡皮擦，抬笔后自动恢复');
+    },700);
+  }
+  private cancelPenHold(){if(this.penHoldTimer!==undefined){window.clearTimeout(this.penHoldTimer);this.penHoldTimer=undefined;}this.penHoldStart=undefined;}
+  private eraseAt(g:Gesture,pt:Point){
+    const page=g.surface.page,before=this.snapshot(),radius=this.eraserSize;
+    const x=pt[0]-radius,y=pt[1]-radius,right=pt[0]+radius,bottom=pt[1]+radius;
+    const intersects=(o:Item)=>{const a=o.rotation*Math.PI/180,rw=(Math.abs(o.w*Math.cos(a))+Math.abs(o.h*Math.sin(a)))/2,rh=(Math.abs(o.w*Math.sin(a))+Math.abs(o.h*Math.cos(a)))/2,cx=o.x+o.w/2,cy=o.y+o.h/2,pad=(o.width??3)*8;return cx+rw+pad>=x&&cx-rw-pad<=right&&cy+rh+pad>=y&&cy-rh-pad<=bottom;};
+    const hits=page.items.filter(o=>!o.locked&&o.kind==='stroke'&&(this.plugin.settings.eraserOnly!=='highlighter'||o.pen==='highlighter')&&intersects(o));
+    if(!hits.length){new Notice('笔尖附近没有可擦除的笔迹');return;}
+    if(this.plugin.settings.eraser==='stroke'){
+      const ids=new Set(hits.map(o=>o.id));
+      page.items=page.items.filter(o=>!ids.has(o.id));
+      this.changed(before);this.repaint();this.updateSelectionBar();new Notice('已擦除 '+ids.size+' 条笔迹');return;
+    }
+    const items=hits.map(item=>({item,outline:this.renderer.strokeOutline(item)}));
+    const segments=[{from:pt as Point,to:[pt[0]+0.01,pt[1]+0.01,pt[2]] as Point}];
+    void this.backgroundEraser.execute({session:uid(),items,segments,radius,standard:this.plugin.settings.eraserPrecision==='standard',whole:false}).then(result=>{
+      if(!result.changes.length){new Notice('笔尖附近没有可擦除的笔迹');return;}
+      const changes=new Map(result.changes.map(c=>[c.id,c.items]));
+      page.items=page.items.flatMap(o=>{const r=changes.get(o.id);if(!r)return[o];return r.map(({item,clip})=>{this.renderer.cacheClip(item,clip);return item;});});
+      this.changed(before);this.repaint();this.updateSelectionBar();new Notice('已擦除');
+    }).catch(error=>{console.error('Penbook',error);new Notice('擦除失败：'+String(error));});
   }
   private pointerMove(e:PointerEvent,s:Surface){
     if(e.pointerType==='pen')this.lastPen=Date.now();
@@ -420,7 +469,7 @@ export class PenbookView extends TextFileView {
       return;
     }
     const g=this.gesture;if(!g||g.ending||g.pointer!==e.pointerId)return;e.preventDefault();const pt=this.point(e,g.surface),last=g.last;
-    if(g.tool==='hand'){this.stage.scrollLeft-=(pt[0]-last[0])*this.zoom;this.stage.scrollTop-=(pt[1]-last[1])*this.zoom;g.last=this.point(e,g.surface);return;}
+    if(this.penHoldStart){const d=Math.hypot(pt[0]-this.penHoldStart[0],pt[1]-this.penHoldStart[1]);if(d>8/this.zoom)this.cancelPenHold();}
     if(g.mode&&g.original&&g.frame){const dx=pt[0]-g.start[0],dy=pt[1]-g.start[1],f=g.frame,c=Math.cos(f.angle),s=Math.sin(f.angle),start=this.framePoint(g.start,f),p=this.framePoint(pt,f);
       const scaleX=Math.max(.05,Math.min(20,1+(p.x-start.x)/Math.max(1,f.w))),scaleY=Math.max(.05,Math.min(20,1+(p.y-start.y)/Math.max(1,f.h))),a=Math.atan2(pt[1]-f.cy,pt[0]-f.cx)-Math.atan2(g.start[1]-f.cy,g.start[0]-f.cx),anchorX=f.cx-f.w/2*c+f.h/2*s,anchorY=f.cy-f.w/2*s-f.h/2*c;
       if(g.mode==='rotate')this.selectionAngle=f.angle+a;
@@ -440,9 +489,10 @@ export class PenbookView extends TextFileView {
   }
   private pointerUp(e:PointerEvent){
     if(this.touches.has(e.pointerId)){this.touches.delete(e.pointerId);if(this.touches.size<2)this.pinch=undefined;if(!this.touches.size){this.drawPages();this.drawFooter();}return;}
+        this.cancelPenHold();if(this.penHoldFired){this.penHoldFired=false;const back=this.penEraserBefore;this.penEraserBefore=undefined;if(back&&back!=='eraser')window.setTimeout(()=>{if(this.tool==='eraser')this.setTool(back);},0);}
     if(this.gesture?.pointer===e.pointerId){const g=this.gesture;const end=this.point(e,g.surface);if(g.tool==='eraser'&&!g.ending)this.queueErase(g,g.last,end);g.last=end;if(g.tool==='pen'&&Math.hypot(end[0]-g.points.at(-1)![0],end[1]-g.points.at(-1)![1])>.2)g.points.push(end);this.finishGesture(true);}
   }
-  private pointerCancel(e:PointerEvent){this.touches.delete(e.pointerId);this.pinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
+  private pointerCancel(e:PointerEvent){this.cancelPenHold();this.touches.delete(e.pointerId);this.pinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
   private finishGesture(commit:boolean):void|Promise<void>{
     const current=this.gesture;
     if(current?.tool==='eraser'&&!current.finalized&&commit){return current.ending??(current.ending=this.finishEraser(current));}

@@ -42,8 +42,25 @@ export function itemSvg(o:Item,book:Notebook,renderer:Renderer,ctx:CanvasRenderi
       if(o.shape==='polygon'||o.shape==='polyline')d=(o.points??[]).map((p,i)=>`${i?'L':'M'}${number(p[0])},${number(p[1])}`).join(' ')+(o.shape==='polygon'?' Z':'');
       else if(o.shape==='triangle')d=ringPath([o.points?.length===3?o.points:[[w/2,0],[w,h],[0,h]]]);
       else if(o.shape==='diamond')d=`M${w/2},0 L${w},${h/2} L${w/2},${h} L0,${h/2} Z`;
-      else{const a=o.points?.[0]??[0,0],b=o.points?.[1]??[w,h],angle=Math.atan2(b[1]-a[1],b[0]-a[0]);d=`M${a[0]},${a[1]} L${b[0]},${b[1]}`;if(o.shape==='arrow')d+=` M${b[0]-16*Math.cos(angle-.45)},${b[1]-16*Math.sin(angle-.45)} L${b[0]},${b[1]} L${b[0]-16*Math.cos(angle+.45)},${b[1]-16*Math.sin(angle+.45)}`;}
+      else{
+        const pts=o.points&&o.points.length>=2?o.points:[[0,0],[w,h]];
+        d=pts.map((p,i)=>`${i?'L':'M'}${number(p[0])},${number(p[1])}`).join(' ');
+        if(o.shape==='arrow'){
+          const b=pts[pts.length-1];let a=pts[pts.length-2];
+          for(let i=pts.length-2;i>=0;i--){if(Math.hypot(b[0]-pts[i][0],b[1]-pts[i][1])>1e-3){a=pts[i];break;}}
+          const angle=Math.atan2(b[1]-a[1],b[0]-a[0]);
+          d+=` M${number(b[0]-16*Math.cos(angle-.45))},${number(b[1]-16*Math.sin(angle-.45))} L${number(b[0])},${number(b[1])} L${number(b[0]-16*Math.cos(angle+.45))},${number(b[1]-16*Math.sin(angle+.45))}`;
+        }
+      }
       content=`<path d="${d}" ${paint}/>`;
+    }
+    if(o.text&&!['line','arrow','polyline'].includes(o.shape??'')){
+      const size=o.fontSize??16,lineHeight=o.lineHeight??1.35,align=o.align??'center';
+      ctx.font=`${o.italic?'italic ':''}${o.bold?'bold ':''}${size}px ${o.font??'sans-serif'}`;
+      const lines=wrapText(o.text,Math.max(1,w-16),v=>ctx.measureText(v).width),step=size*lineHeight,startY=h/2-((lines.length-1)*step)/2;
+      const tx=align==='left'?8:align==='right'?w-8:w/2,anchor=align==='center'?'middle':align==='right'?'end':'start';
+      const label=`<text x="${number(tx)}" y="${number(startY)}" dominant-baseline="central" text-anchor="${anchor}" fill="${color}" font-family="${escapeXml(o.font??'sans-serif')}" font-size="${size}"${o.bold?' font-weight="bold"':''}${o.italic?' font-style="italic"':''}>${lines.map((line,i)=>`<tspan x="${number(tx)}" dy="${i?number(step):0}">${escapeXml(line)}</tspan>`).join('')}</text>`;
+      content+=clipped(label,4,4,Math.max(0,w-8),Math.max(0,h-8),`${id}-label`);
     }
   }else if(o.kind==='tape'){
     content=o.points?`<path d="${ringPath([getStroke(o.points,{size:o.width??24,thinning:0,simulatePressure:false})])}" fill="${color}"/>`:`<rect width="${w}" height="${h}" fill="${color}"/>`;

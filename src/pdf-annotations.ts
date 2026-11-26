@@ -33,6 +33,7 @@ function vectorAppearance(o:Item,renderer:Renderer):string|undefined{
   }
   if(o.kind==='tape')return ops+(o.points?path(getStroke(o.points,{size:o.width??24,thinning:0,simulatePressure:false}),true):`0 0 ${w} ${h} re`)+'\nf';
   if(o.kind!=='shape')return;
+  if(o.text&&!['line','arrow','polyline'].includes(o.shape??''))return;
   let d='';
   if(o.shape==='ellipse'){
     const k=.552284749831,cx=w/2,cy=h/2;d=`${w} ${cy} m ${w} ${cy+k*cy} ${cx+k*cx} ${h} ${cx} ${h} c ${cx-k*cx} ${h} 0 ${cy+k*cy} 0 ${cy} c 0 ${cy-k*cy} ${cx-k*cx} 0 ${cx} 0 c ${cx+k*cx} 0 ${w} ${cy-k*cy} ${w} ${cy} c h`;
@@ -43,7 +44,7 @@ function vectorAppearance(o:Item,renderer:Renderer):string|undefined{
   else if(o.shape==='triangle')d=path(o.points?.length===3?o.points:[[w/2,0],[w,h],[0,h]],true);
   else if(o.shape==='polygon'||o.shape==='polyline')d=path(o.points??[],o.shape==='polygon');
   else if(o.shape==='diamond')d=path([[w/2,0],[w,h/2],[w/2,h],[0,h/2]],true);
-  else{const a=o.points?.[0]??[0,0],b=o.points?.[1]??[w,h],angle=Math.atan2(b[1]-a[1],b[0]-a[0]);d=path([a,b]);if(o.shape==='arrow')d+='\n'+path([[b[0]-16*Math.cos(angle-.45),b[1]-16*Math.sin(angle-.45)],b,[b[0]-16*Math.cos(angle+.45),b[1]-16*Math.sin(angle+.45)]]);}
+  else{const pts=o.points&&o.points.length>=2?o.points:[[0,0],[w,h]];const b=pts[pts.length-1];let a=pts[pts.length-2];for(let i=pts.length-2;i>=0;i--){if(Math.hypot(b[0]-pts[i][0],b[1]-pts[i][1])>1e-3){a=pts[i];break;}}const angle=Math.atan2(b[1]-a[1],b[0]-a[0]);d=path(pts);if(o.shape==='arrow')d+='\n'+path([[b[0]-16*Math.cos(angle-.45),b[1]-16*Math.sin(angle-.45)],b,[b[0]-16*Math.cos(angle+.45),b[1]-16*Math.sin(angle+.45)]]);}
   return ops+(o.fill&&!['line','arrow'].includes(o.shape??'')?`q /Fill gs ${d} f Q\n`:'')+d+'\nS';
 }
 export async function addObjectAnnotation(out:PDFDocument,target:PDFPage,page:Page,o:Item,book:Notebook,renderer:Renderer):Promise<AnnotationArchive['pages'][number]['annotations'][number]>{
@@ -72,7 +73,11 @@ export async function addObjectAnnotation(out:PDFDocument,target:PDFPage,page:Pa
   if(o.kind==='sticky'){subtype='Text';extra.Name='Comment';}
   else if(o.kind==='text'){subtype='FreeText';extra.DA=PDFString.of(`/Helv ${o.fontSize??22} Tf ${rgb(o.color).join(' ')} rg`);}
   else if(o.kind==='shape'){
-    if(['line','arrow'].includes(o.shape??'')){subtype='Line';const a=o.points?.[0]??[0,0],b=o.points?.[1]??[o.bw,o.bh];extra.L=[...local(a[0],a[1]),...local(b[0],b[1])];if(o.shape==='arrow')extra.LE=['None','OpenArrow'];}
+    if(['line','arrow'].includes(o.shape??'')){
+      if(o.points&&o.points.length>2){subtype='PolyLine';extra.Vertices=o.points.flatMap(p=>local(p[0],p[1]));}
+      else{subtype='Line';const a=o.points?.[0]??[0,0],b=o.points?.[1]??[o.bw,o.bh];extra.L=[...local(a[0],a[1]),...local(b[0],b[1])];}
+      if(o.shape==='arrow')extra.LE=['None','OpenArrow'];
+    }
     else if(o.shape==='triangle'||o.shape==='diamond'||o.shape==='polygon'||o.shape==='polyline'){subtype=o.shape==='polyline'?'PolyLine':'Polygon';extra.Vertices=(o.shape==='diamond'?[[o.bw/2,0],[o.bw,o.bh/2],[o.bw/2,o.bh],[0,o.bh/2]]:o.points?.length?o.points:[[o.bw/2,0],[o.bw,o.bh],[0,o.bh]]).flatMap(p=>local(p[0],p[1]));}
     else subtype=o.shape==='ellipse'?'Circle':'Square';
   }

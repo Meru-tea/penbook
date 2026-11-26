@@ -71,6 +71,10 @@ import infinitySvg from '@phosphor-icons/core/assets/regular/infinity.svg';
 import crosshairSvg from '@phosphor-icons/core/assets/regular/crosshair.svg';
 import mapTrifoldSvg from '@phosphor-icons/core/assets/regular/map-trifold.svg';
 import gridFourSvg from '@phosphor-icons/core/assets/regular/grid-four.svg';
+import alignCenterHvg from '@phosphor-icons/core/assets/regular/align-center-horizontal.svg';
+import flipHorizontalSvg from '@phosphor-icons/core/assets/regular/flip-horizontal.svg';
+import funnelSvg from '@phosphor-icons/core/assets/regular/funnel.svg';
+import selectionMarqueeSvg from '@phosphor-icons/core/assets/regular/selection.svg';
 
 /** Official Phosphor regular SVG outlines, kept in their native 256-unit coordinates. */
 function outline(svg:string){return [...svg.matchAll(/<path\b[^>]*\bd="([^"]+)"/g)].map(match=>match[1]).join(' ');}
@@ -149,13 +153,17 @@ const infinite=outline(infinitySvg);
 const origin=outline(crosshairSvg);
 const minimap=outline(mapTrifoldSvg);
 const guides=outline(gridFourSvg);
+const align=outline(alignCenterHvg);
+const flip=outline(flipHorizontalSvg);
+const filter=outline(funnelSvg);
+const marquee=outline(selectionMarqueeSvg);
 
-export const ICONS={pen:penNib,eraser,lasso,shape:shapes,text:textBox,sticky:note,link,table,hand,undo,redo,plus,import:importIcon,export:exportIcon,read:book,fullscreen,more,sidebar,previous:left,next:right,minus,fit,copy,paste,delete:trash,palette,rotate,front,back,lock,unlock,group,ungroup,edit,crop,move,bookmark,notebook,settings,pdf,image,file,print,search,infinite,origin,minimap,guides};
+export const ICONS={pen:penNib,eraser,lasso,shape:shapes,text:textBox,sticky:note,link,table,hand,undo,redo,plus,import:importIcon,export:exportIcon,read:book,fullscreen,more,sidebar,previous:left,next:right,minus,fit,copy,paste,delete:trash,palette,rotate,front,back,lock,unlock,group,ungroup,edit,crop,move,bookmark,notebook,settings,pdf,image,file,print,search,infinite,origin,minimap,guides,align,flip,filter,marquee};
 export type IconName=keyof typeof ICONS;
 export const ERASER_ICONS={stroke:eraser,pixel:eraser};
 export const SELECT_ALL_ICON=selectAll;
 export const LASER_ICON=laser;
-export const UI_ICONS={check,close,tune,eyedropper,bold,italic,alignLeft,alignCenter,alignRight,lineHeight,pin,tape,dot};
+export const UI_ICONS={check,close,tune,eyedropper,bold,italic,alignLeft,alignCenter,alignRight,lineHeight,pin,tape,dot,marquee};
 export const PEN_ICONS={fountain:penNib,ballpoint:pen,brush,pencil,highlighter:marker};
 export const SHAPE_ICONS={auto:shapes,rectangle,ellipse:circle,triangle,line:minus,arrow,diamond,rounded};
 export function pathIcon(el:HTMLElement,pathData:string,size=20){const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 256 256');svg.setAttribute('width',String(size));svg.setAttribute('height',String(size));svg.setAttribute('aria-hidden','true');svg.classList.add('pb-icon');const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d',pathData);path.setAttribute('fill','currentColor');svg.appendChild(path);el.appendChild(svg);return svg;}
@@ -164,7 +172,7 @@ export function icon(el:HTMLElement,name:IconName,size=20){return pathIcon(el,IC
 export function dropdownIcon(el:HTMLElement){return pathIcon(el,down,18);}
 export function actionIcon(title:string):IconName{
   if(title==='移动或复制选区到其他页')return 'move';
-  const exact:Record<string,IconName>={'钢笔':'pen','橡皮擦':'eraser','套索选择':'lasso','形状':'shape','文本框':'text','便签':'sticky','链接':'link','表格':'table','平移':'hand','显示或隐藏页面列表':'sidebar','显示或隐藏书签与搜索':'sidebar','搜索书签与画布内容':'search','沉浸模式':'fullscreen','笔记本与页面选项':'more','画布与笔记本选项':'more','上一页':'previous','下一页':'next','缩小':'minus','放大':'plus','适合宽度':'fit','适应全部内容':'fit','回到原点':'origin','回到原点 (0, 0, 100%)':'origin','显示或隐藏小地图':'minimap','小地图':'minimap','添加视角书签':'bookmark','显示 A4 参考虚线':'guides','移到顶层':'front','移到底层':'back','取消组合':'ungroup'};
+  const exact:Record<string,IconName>={'钢笔':'pen','橡皮擦':'eraser','套索选择':'lasso','矩形框选':'marquee','网格吸附':'guides','形状':'shape','文本框':'text','便签':'sticky','链接':'link','表格':'table','平移':'hand','显示或隐藏页面列表':'sidebar','显示或隐藏书签与搜索':'sidebar','搜索书签与画布内容':'search','沉浸模式':'fullscreen','笔记本与页面选项':'more','画布与笔记本选项':'more','上一页':'previous','下一页':'next','缩小':'minus','放大':'plus','适合宽度':'fit','适应全部内容':'fit','回到原点':'origin','回到原点 (0, 0, 100%)':'origin','显示或隐藏小地图':'minimap','小地图':'minimap','添加视角书签':'bookmark','显示 A4 参考虚线':'guides','移到顶层':'front','移到底层':'back','取消组合':'ungroup','对齐与分布':'align','翻转选区':'flip','按类型筛选选区':'filter'};
   if(exact[title])return exact[title];
   if(title.startsWith('删除'))return 'delete';
   if(title==='更多书写工具')return 'more';

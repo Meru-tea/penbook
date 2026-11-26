@@ -3,13 +3,18 @@ export type Paper = 'blank' | 'ruled' | 'grid' | 'dots' | 'cornell' | 'music' | 
 export type Pen = 'ballpoint' | 'fountain' | 'brush' | 'pencil' | 'highlighter';
 export type Shape = 'line' | 'arrow' | 'rectangle' | 'ellipse' | 'triangle' | 'diamond' | 'rounded' | 'polygon' | 'polyline';
 export type StrokeStyle='solid'|'dashed'|'dotted';
-export interface InkProfile { tip:number; sensitivity:number; flatness:number; stability:number; style:StrokeStyle; reduceLatency:boolean; straight:boolean; holdToSnap:boolean; alignShapes:boolean; fill:boolean; autoShape?:boolean }
+export interface InkProfile { tip:number; sensitivity:number; flatness:number; stability:number; style:StrokeStyle; reduceLatency:boolean; straight:boolean; holdToSnap:boolean; alignShapes:boolean; fill:boolean; autoShape?:boolean; scribbleToErase?:boolean }
 export const DEFAULT_INK:InkProfile={tip:25,sensitivity:50,flatness:0,stability:0,style:'solid',reduceLatency:true,straight:false,holdToSnap:false,alignShapes:true,fill:false};
+export type AnchorSide = 'center' | 'top' | 'right' | 'bottom' | 'left';
+export type ConnectorRoute = 'straight' | 'elbow' | 'curved';
 export interface Item {
   id: string; kind: 'stroke' | 'shape' | 'text' | 'image' | 'link' | 'table' | 'sticky' | 'tape';
   x: number; y: number; w: number; h: number; rotation: number; bw: number; bh: number;
   color: string; opacity: number; locked?: boolean; group?: string;
   points?: Point[]; pen?: Pen; width?: number; shape?: Shape;
+  startBinding?: { itemId: string; anchor: AnchorSide };
+  endBinding?: { itemId: string; anchor: AnchorSide };
+  connectorRoute?: ConnectorRoute;
   eraseMasks?: [number,number][][][];
   frozenInk?: [number,number][][];
   text?: string; font?: string; fontSize?: number; bold?: boolean; italic?: boolean;
@@ -100,6 +105,16 @@ export function parseBook(text: string): Notebook {
       if(o.frozenInk&&(!Array.isArray(o.frozenInk)||o.frozenInk.some((r:unknown)=>!Array.isArray(r)||r.some((p:unknown)=>!Array.isArray(p)||p.length!==2||!p.every(Number.isFinite)))))throw new Error('笔迹轮廓数据不完整。');
       if(o.pdfNative&&(!Array.isArray(o.pdfNative.matrix)||o.pdfNative.matrix.length!==6||!o.pdfNative.matrix.every(Number.isFinite)||typeof o.pdfNative.resource!=='string'||typeof o.pdfNative.id!=='string'||typeof o.pdfNative.subtype!=='string'||!Number.isInteger(o.pdfNative.page)||o.pdfNative.page<0))throw new Error('原始 PDF 批注数据不完整。');
       if(o.pdfMarkup?.quadPoints&&(!Array.isArray(o.pdfMarkup.quadPoints)||o.pdfMarkup.quadPoints.some((p:unknown)=>!Array.isArray(p)||p.length!==3||!p.every(Number.isFinite))))throw new Error('PDF 文字标记数据不完整。');
+      for(const binding of [o.startBinding,o.endBinding]){
+        if(binding!==undefined){
+          if(!binding||typeof binding!=='object'||Array.isArray(binding)||typeof binding.itemId!=='string'||!binding.itemId||!['center','top','right','bottom','left'].includes(binding.anchor)){
+            throw new Error('连接器绑定数据不完整，原文件未被修改。');
+          }
+        }
+      }
+      if(o.connectorRoute!==undefined&&!['straight','elbow','curved'].includes(o.connectorRoute)){
+        throw new Error('连接器路径数据不受支持，原文件未被修改。');
+      }
       if(o.kind==='table'){
         if(o.rows!==undefined&&(!Number.isInteger(o.rows)||o.rows<1||o.rows>50)||o.columns!==undefined&&(!Number.isInteger(o.columns)||o.columns<1||o.columns>30)||o.cells!==undefined&&(!Array.isArray(o.cells)||o.cells.some((row:unknown)=>!Array.isArray(row)||row.some((cell:unknown)=>typeof cell!=='string'))))throw new Error('表格数据不完整，原文件未被修改。');
         const rows=Number.isFinite(o.rows)?Math.max(1,Math.min(50,Math.floor(o.rows))):4,columns=Number.isFinite(o.columns)?Math.max(1,Math.min(30,Math.floor(o.columns))):3;

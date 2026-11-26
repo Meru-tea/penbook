@@ -4,10 +4,12 @@ import { notebookWizard, PAPER_NAMES, coverPreview, paperPreview } from './templ
 import { PRESET_COLORS } from './palette';
 import { form, pickFile } from './dialogs';
 import { PenbookView, VIEW_TYPE } from './view';
-import { icon, registerIcons } from './icons';
+import { registerIcons } from './icons';
 import { installTooltips } from './tooltips';
 import { SHORTCUTS, shortcutHint } from './shortcuts';
 import { SelectionClipboard } from './selection-clipboard';
+import { PenFavorite, normalizePenFavorites } from './pen-favorites';
+import { PenbookEmbedManager } from './embed';
 
 export interface Preferences {
   folder:string; paper:Paper; penColor:string; penWidth:number; pressure:number; fingerInk:boolean;
@@ -15,17 +17,20 @@ export interface Preferences {
   customColors:string[];presetColors:string[];
   colorHistory:string[]; inkProfiles:Partial<Record<Pen,InkProfile>>; eraserPrecision:'fine'|'standard'; eraserOnly:'all'|'highlighter'|'tape'; eraserAutoPrevious:boolean;
   penEnabled:boolean; scrollDirection:'vertical'|'horizontal'; showResolved:boolean;
+  penFavorites?:PenFavorite[]; gridSnap?:boolean;
 }
-export const DEFAULTS:Preferences={folder:'手写笔记',paper:'ruled',penColor:'#000000',penWidth:3,pressure:1,fingerInk:false,leftHanded:false,toolbarBottom:false,language:'zh',exportScale:1.5,eraser:'stroke',customColors:[],presetColors:PRESET_COLORS,colorHistory:[],inkProfiles:{},eraserPrecision:'standard',eraserOnly:'all',eraserAutoPrevious:false,penEnabled:true,scrollDirection:'vertical',showResolved:false};
+export const DEFAULTS:Preferences={folder:'手写笔记',paper:'ruled',penColor:'#000000',penWidth:3,pressure:1,fingerInk:false,leftHanded:false,toolbarBottom:false,language:'zh',exportScale:1.5,eraser:'stroke',customColors:[],presetColors:PRESET_COLORS,colorHistory:[],inkProfiles:{},eraserPrecision:'standard',eraserOnly:'all',eraserAutoPrevious:false,penEnabled:true,scrollDirection:'vertical',showResolved:false,penFavorites:normalizePenFavorites(),gridSnap:false};
 
 export default class PenbookPlugin extends Plugin {
   settings:Preferences={...DEFAULTS};
   selectionClipboard:SelectionClipboard|null=null;
+  embedManager?:PenbookEmbedManager;
   async onload(){
     registerIcons();
     this.register(installTooltips());
     this.settings={...DEFAULTS,...await this.loadData()};
     this.settings.presetColors=[...new Set([...this.settings.presetColors,...this.settings.customColors])];this.settings.inkProfiles={...this.settings.inkProfiles};this.settings.colorHistory=[...this.settings.colorHistory];
+    this.settings.penFavorites=normalizePenFavorites(this.settings.penFavorites);this.settings.gridSnap=Boolean(this.settings.gridSnap);
     this.registerView(VIEW_TYPE,leaf=>new PenbookView(leaf,this));this.registerExtensions(['penbook'],VIEW_TYPE);
     this.addRibbonIcon('pb-pen','新建手写笔记本',()=>void this.createNotebook());
     this.addCommand({id:'new-notebook',name:'新建手写笔记本',callback:()=>void this.createNotebook()});
@@ -49,23 +54,12 @@ export default class PenbookPlugin extends Plugin {
         else if(params.page)leaf.view.goToId(params.page);
       }
     });
-    this.registerMarkdownCodeBlockProcessor('penbook',async(source,el,ctx)=>{
-      const [path,targetId]=source.trim().split('#');const file=this.app.metadataCache.getFirstLinkpathDest(path,ctx.sourcePath);
-      if(!file||file.extension!=='penbook'){el.setText('找不到 Penbook 笔记本');return;}
-      try{const book=parseBook(await this.app.vault.read(file));
-        if(isInfiniteBook(book)){
-          const bm=targetId?book.bookmarks?.find(b=>b.id===targetId):undefined;
-          const button=el.createEl('button',{text:`${book.title} · ${bm?bm.title:'无界笔记'}`});icon(button,'infinite');
-          button.onclick=async()=>{const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);if(leaf.view instanceof PenbookView&&bm)leaf.view.goToBookmarkId(bm.id);};
-        }else{
-          const page=book.pages.find(p=>p.id===targetId)??book.pages[0];
-          const button=el.createEl('button',{text:`${book.title} · ${page.title||'第 '+(book.pages.indexOf(page)+1)+' 页'}`});icon(button,'notebook');
-          button.onclick=async()=>{const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);if(leaf.view instanceof PenbookView)leaf.view.goToId(page.id);};
-        }
-        const cached=this.app.vault.getAbstractFileByPath(`${file.parent?.path??''}/${file.basename}.preview.png`);if(cached instanceof TFile)el.createEl('img',{attr:{src:this.app.vault.getResourcePath(cached),alt:book.title}});
-      }catch{el.setText('无法读取 Penbook 文件');}
-    });
+    this.embedManager=new PenbookEmbedManager(this);
+    this.embedManager.register(this);
     this.addSettingTab(new PenbookSettings(this));
+  }
+  onunload(){
+    void this.embedManager?.unload();
   }
   asset(path:string){const url=this.app.vault.adapter.getResourcePath(normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${path}`));return path.endsWith('/')?url.split('?')[0].replace(/\/?$/,'/'):url;}
   async saveSettings(){await this.saveData(this.settings);}

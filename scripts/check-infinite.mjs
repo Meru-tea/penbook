@@ -8,16 +8,22 @@ const bundle = await build({
     contents: `
       import { SHORTCUTS, EDIT_ACTIONS, SELECTION_ACTIONS, shortcutAction, shortcutHint } from './src/shortcuts';
       import { pageAtOffset } from './src/page-navigation';
-      import { newBook, newPage, parseBook, item, clone, uid, isInfiniteBook, normalizeInfinitePaper } from './src/model';
+      import { newBook, newPage, parseBook, item, clone, uid, isInfiniteBook, normalizeInfinitePaper, DEFAULT_INK } from './src/model';
       import { selectionClipboard, pasteItems } from './src/selection-clipboard';
       import { historyWeight } from './src/history';
       import { A4_HEIGHT, A4_WIDTH, INFINITE_MAX_ZOOM, INFINITE_MIN_ZOOM, adaptiveGridStep, buildVirtualExportPage, clampInfiniteZoom, computeA4Tiles, contentBounds, drawInfiniteBackground, filterVisibleItems, fitCameraToBounds, itemAABB, pinchTransform, rectsIntersect, renderInfiniteExportCanvas, screenToWorld, visibleWorldRect, worldToScreen, zoomAtScreenPoint } from './src/infinite';
+      import { alignItems, computeMoveSnap, filterSelectionByKind, flipItems, itemsInRect } from './src/selection-tools';
+      import { CONNECTABLE_SHAPES, adjustSnappedShape, clearDanglingBindings, computeConnectorPoints, findNearestAnchor, findScribbleTargets, getShapeAnchors, isScribbleGesture, updateBoundConnectors } from './src/shape-connectors';
+      import { PdfSearchController, drawSearchHighlights } from './src/pdf-search';
+      const DEFAULT_PEN_FAVORITES = [], MAX_PEN_FAVORITES = 6;
+      const normalizePenFavorites = x => x ?? [], renderPenFavoritesDock = () => {}, upsertPenFavorite = (a, b) => [...(a ?? []), b];
+      const formatEmbedLink = (p, id) => '![[' + p + (id ? '#' + id : '') + ']]';
       const PEN_ICONS = { fountain: '', ballpoint: '', brush: '', pencil: '', highlighter: '' };
       const SHAPE_ICONS = { auto: '', rectangle: '', ellipse: '', triangle: '', line: '', arrow: '', diamond: '', rounded: '' };
       const ERASER_ICONS = { stroke: '', pixel: '' };
       const SELECT_ALL_ICON = '', LASER_ICON = '';
-      const UI_ICONS = { check: '', close: '', tune: '', eyedropper: '', bold: '', italic: '', alignLeft: '', alignCenter: '', alignRight: '', lineHeight: '', pin: '', tape: '', dot: '' };
-      const ICONS = { rotate: '' };
+      const UI_ICONS = { check: '', close: '', tune: '', eyedropper: '', bold: '', italic: '', alignLeft: '', alignCenter: '', alignRight: '', lineHeight: '', pin: '', tape: '', dot: '', marquee: '' };
+      const ICONS = { rotate: '', lasso: '', guides: '', align: '', flip: '', filter: '', marquee: '' };
       const actionIcon = () => 'settings';
       const TextFileView = class {};
       const Notice = class { constructor(public message = '') {} };

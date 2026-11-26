@@ -67,6 +67,10 @@ import pinSvg from '@phosphor-icons/core/assets/regular/push-pin-simple.svg';
 import tapeSvg from '@phosphor-icons/core/assets/regular/selection-background.svg';
 import dotSvg from '@phosphor-icons/core/assets/regular/dot.svg';
 import diamondSvg from '@phosphor-icons/core/assets/regular/diamond.svg';
+import infinitySvg from '@phosphor-icons/core/assets/regular/infinity.svg';
+import crosshairSvg from '@phosphor-icons/core/assets/regular/crosshair.svg';
+import mapTrifoldSvg from '@phosphor-icons/core/assets/regular/map-trifold.svg';
+import gridFourSvg from '@phosphor-icons/core/assets/regular/grid-four.svg';
 
 /** Official Phosphor regular SVG outlines, kept in their native 256-unit coordinates. */
 function outline(svg:string){return [...svg.matchAll(/<path\b[^>]*\bd="([^"]+)"/g)].map(match=>match[1]).join(' ');}
@@ -141,8 +145,12 @@ const pin=outline(pinSvg);
 const tape=outline(tapeSvg);
 const dot=outline(dotSvg);
 const diamond=outline(diamondSvg);
+const infinite=outline(infinitySvg);
+const origin=outline(crosshairSvg);
+const minimap=outline(mapTrifoldSvg);
+const guides=outline(gridFourSvg);
 
-export const ICONS={pen:penNib,eraser,lasso,shape:shapes,text:textBox,sticky:note,link,table,hand,undo,redo,plus,import:importIcon,export:exportIcon,read:book,fullscreen,more,sidebar,previous:left,next:right,minus,fit,copy,paste,delete:trash,palette,rotate,front,back,lock,unlock,group,ungroup,edit,crop,move,bookmark,notebook,settings,pdf,image,file,print,search};
+export const ICONS={pen:penNib,eraser,lasso,shape:shapes,text:textBox,sticky:note,link,table,hand,undo,redo,plus,import:importIcon,export:exportIcon,read:book,fullscreen,more,sidebar,previous:left,next:right,minus,fit,copy,paste,delete:trash,palette,rotate,front,back,lock,unlock,group,ungroup,edit,crop,move,bookmark,notebook,settings,pdf,image,file,print,search,infinite,origin,minimap,guides};
 export type IconName=keyof typeof ICONS;
 export const ERASER_ICONS={stroke:eraser,pixel:eraser};
 export const SELECT_ALL_ICON=selectAll;
@@ -156,11 +164,11 @@ export function icon(el:HTMLElement,name:IconName,size=20){return pathIcon(el,IC
 export function dropdownIcon(el:HTMLElement){return pathIcon(el,down,18);}
 export function actionIcon(title:string):IconName{
   if(title==='移动或复制选区到其他页')return 'move';
-  const exact:Record<string,IconName>={'钢笔':'pen','橡皮擦':'eraser','套索选择':'lasso','形状':'shape','文本框':'text','便签':'sticky','链接':'link','表格':'table','平移':'hand','显示或隐藏页面列表':'sidebar','沉浸模式':'fullscreen','笔记本与页面选项':'more','上一页':'previous','下一页':'next','缩小':'minus','放大':'plus','适合宽度':'fit','移到顶层':'front','移到底层':'back','取消组合':'ungroup'};
+  const exact:Record<string,IconName>={'钢笔':'pen','橡皮擦':'eraser','套索选择':'lasso','形状':'shape','文本框':'text','便签':'sticky','链接':'link','表格':'table','平移':'hand','显示或隐藏页面列表':'sidebar','显示或隐藏书签与搜索':'sidebar','搜索书签与画布内容':'search','沉浸模式':'fullscreen','笔记本与页面选项':'more','画布与笔记本选项':'more','上一页':'previous','下一页':'next','缩小':'minus','放大':'plus','适合宽度':'fit','适应全部内容':'fit','回到原点':'origin','回到原点 (0, 0, 100%)':'origin','显示或隐藏小地图':'minimap','小地图':'minimap','添加视角书签':'bookmark','显示 A4 参考虚线':'guides','移到顶层':'front','移到底层':'back','取消组合':'ungroup'};
   if(exact[title])return exact[title];
   if(title.startsWith('删除'))return 'delete';
   if(title==='更多书写工具')return 'more';
   if(title==='切换阅读与书写')return 'read';
-  for(const [text,name]of [['撤销','undo'],['重做','redo'],['导入','import'],['导出','export'],['阅读','read'],['插入页面','plus'],['添加页面','plus'],['复制','copy'],['粘贴','paste'],['删除','delete'],['颜色','palette'],['旋转','rotate'],['解锁','unlock'],['锁定','lock'],['组合','group'],['编辑','edit'],['裁剪','crop'],['移动','move'],['打印','print'],['PDF','pdf'],['图片','image'],['书签','bookmark'],['索引','file'],['搜索','search']]as [string,IconName][])if(title.includes(text))return name;
+  for(const [text,name]of [['撤销','undo'],['重做','redo'],['导入','import'],['导出','export'],['阅读','read'],['插入页面','plus'],['添加页面','plus'],['复制','copy'],['粘贴','paste'],['删除','delete'],['颜色','palette'],['旋转','rotate'],['解锁','unlock'],['锁定','lock'],['组合','group'],['编辑','edit'],['裁剪','crop'],['移动','move'],['打印','print'],['PDF','pdf'],['图片','image'],['书签','bookmark'],['索引','file'],['搜索','search'],['原点','origin'],['小地图','minimap'],['参考线','guides'],['无界','infinite']]as [string,IconName][])if(title.includes(text))return name;
   return 'settings';
 }

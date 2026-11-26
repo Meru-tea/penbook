@@ -1,6 +1,6 @@
 import { TextFileView, WorkspaceLeaf, Notice, Menu, TFile, normalizePath, Setting, Scope } from 'obsidian';
 import PenbookPlugin, { PAPERS } from './main';
-import { Notebook, Page, Item, Point, Pen, Shape, Paper, InkProfile, Resource, DEFAULT_INK, uid, clone, newBook, newPage, parseBook, item, stroke, contains, localPoint, inPolygon, encode, decode, resourceUrl } from './model';
+import { Notebook, Page, Item, Point, Pen, Shape, Paper, InkProfile, Resource, DEFAULT_INK, ViewportBookmark, isInfiniteBook, uid, clone, newBook, newPage, parseBook, item, stroke, contains, localPoint, inPolygon, encode, decode, resourceUrl } from './model';
 import { Renderer } from './render';
 import { PDFs } from './pdf';
 import { copyPages } from './page-transfer';
@@ -8,7 +8,7 @@ import { form, pickFile, localFile, confirmAction, sizeControl, sizeDialog, popo
 import { icon, pathIcon, dropdownIcon, PEN_ICONS, SHAPE_ICONS, ERASER_ICONS, SELECT_ALL_ICON, LASER_ICON, UI_ICONS, ICONS, actionIcon } from './icons';
 import { panelHeader, section, row, toggle, slider, cards, segments } from './panels';
 import { inkPalette } from './palette';
-import { templatePicker } from './templates';
+import { templatePicker, infiniteTemplatePicker } from './templates';
 import { calculate } from './calculate';
 import { recognizeShape } from './auto-shape';
 import { fontSelect } from './fonts';
@@ -21,16 +21,25 @@ import { pageAtOffset } from './page-navigation';
 import { SelectionClipboard, selectionClipboard, pasteItems } from './selection-clipboard';
 import { importPdfPages } from './pdf-import';
 import { cropPage, rotateCrop } from './page-crop';
+import { A4_HEIGHT, A4_WIDTH, Camera, INFINITE_MAX_ZOOM, INFINITE_MIN_ZOOM, Rect, Size, buildVirtualExportPage, clampInfiniteZoom, computeA4Tiles, contentBounds, drawInfiniteBackground, filterVisibleItems, fitCameraToBounds, itemAABB, pinchTransform, rectsIntersect, renderInfiniteExportCanvas, screenToWorld, visibleWorldRect, worldToScreen, zoomAtScreenPoint } from './infinite';
 
 export const VIEW_TYPE='penbook-view';
 const AUTO_SHAPE_MOVE_THRESHOLD=8;
 type Tool='pen'|'eraser'|'lasso'|'shape'|'text'|'sticky'|'link'|'table'|'hand'|'laser'|'tape';
 interface Surface {page:Page;sheet:HTMLElement;bg:HTMLCanvasElement;ink:HTMLCanvasElement;ui:HTMLCanvasElement;text:HTMLElement;epoch:number;visible?:boolean;backgroundReady?:boolean;controller?:AbortController;paintVersion?:number;images?:Map<string,HTMLImageElement>;}
 interface SelectionFrame {cx:number;cy:number;w:number;h:number;angle:number;}
-interface Gesture {pointer:number;pointerType?:string;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;lastMoved?:number;holdPoint?:Point;snapped?:Item;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
+interface Gesture {pointer:number;pointerType?:string;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;panX?:number;panY?:number;lastMoved?:number;holdPoint?:Point;snapped?:Item;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
 
 export class PenbookView extends TextFileView {
   book:Notebook=newBook();index=0;valid=false;raw='';
+  get infinite(){return isInfiniteBook(this.book);}
+  camera:Camera={x:0,y:0,zoom:1};showGuides=false;
+  private minimapVisible=false;private minimapEl?:HTMLElement;private minimapCanvas?:HTMLCanvasElement;
+  private minimapDragging?:{pointerId:number;bounds:Rect};
+  private spacePanning=false;private middlePan?:{pointerId:number;lastX:number;lastY:number};
+  private infinitePinch?:{camera:Camera;mid:[number,number];distance:number};
+  private infiniteFrame?:number;private cameraSaveTimer?:number;private sidebarInitBook?:Notebook;
+  private zoomLabelEl?:HTMLElement;private coordLabelEl?:HTMLElement;private inlineReposition?:()=>void;
   root!:HTMLElement;toolbar!:HTMLElement;toolbarWrap!:HTMLElement;contextWrap!:HTMLElement;contextEl!:HTMLElement;sidebar!:HTMLElement;stage!:HTMLElement;pagesEl!:HTMLElement;footer!:HTMLElement;selectionBar!:HTMLElement;
   renderer=new Renderer();pdfs:PDFs;surfaces:Surface[]=[];
   tool:Tool='pen';pen:Pen='fountain';shape:Shape='rectangle';color:string;width:number;eraserSize=22;
@@ -76,10 +85,13 @@ export class PenbookView extends TextFileView {
     // Vault echoes our own saves; rebuilding here would discard an active text editor.
     if(!clear&&this.valid&&(data===this.lastWritten||data===this.raw&&!this.dirty&&!this.gesture))return;
     if(clear)this.clear();this.raw=data;
-    try{this.book=parseBook(data);this.valid=true;this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();this.renderer.clear();void this.pdfs.clear();this.render();}
+    try{this.book=parseBook(data);this.valid=true;this.index=Math.min(this.index,this.book.pages.length-1);
+      if(this.infinite){const vp=this.book.viewport??{x:0,y:0,zoom:1,showGuides:false};this.camera={x:vp.x,y:vp.y,zoom:clampInfiniteZoom(vp.zoom)};this.zoom=this.camera.zoom;this.showGuides=Boolean(vp.showGuides);}
+      this.selection.clear();this.renderer.clear();void this.pdfs.clear();this.render();}
     catch(error){this.valid=false;this.contentEl.empty();this.contentEl.createDiv({cls:'pb-error',text:String(error)});}
   }
-  clear(){this.finishGesture(false);this.releaseSurfaces();this.thumbsController?.abort();this.snapshots.clear();this.undoStack=[];this.redoStack=[];this.selection.clear();this.index=0;this.valid=false;this.renderer.clear();void this.pdfs.clear();if(this.saveTimer)window.clearTimeout(this.saveTimer);this.dirty=false;this.lastWritten=undefined;}
+  clear(){this.finishGesture(false);this.releaseSurfaces();this.thumbsController?.abort();this.snapshots.clear();this.undoStack=[];this.redoStack=[];this.selection.clear();this.index=0;this.valid=false;this.renderer.clear();void this.pdfs.clear();if(this.saveTimer)window.clearTimeout(this.saveTimer);this.dirty=false;this.lastWritten=undefined;
+    this.camera={x:0,y:0,zoom:1};this.showGuides=false;this.minimapVisible=false;this.spacePanning=false;this.middlePan=undefined;this.infinitePinch=undefined;this.sidebarInitBook=undefined;if(this.cameraSaveTimer!==undefined){window.clearTimeout(this.cameraSaveTimer);this.cameraSaveTimer=undefined;}if(this.infiniteFrame!==undefined){cancelAnimationFrame(this.infiniteFrame);this.infiniteFrame=undefined;}}
   async onOpen(){this.closed=false;this.contentEl.addClass('pb-view-content');
     this.wasActive=this.app.workspace.getActiveViewOfType(PenbookView)===this;
     this.registerEvent(this.app.workspace.on('active-leaf-change',leaf=>{const active=leaf?.view===this;if(this.wasActive&&!active)void this.run(()=>this.savePendingEdits());this.wasActive=active;}));
@@ -87,20 +99,21 @@ export class PenbookView extends TextFileView {
     // keep the window alive until the vault write has completed.
     this.registerEvent(this.app.workspace.on('quit',tasks=>tasks.add(()=>this.savePendingEdits())));
     const doc=this.contentEl.ownerDocument,win=doc.defaultView;
-    if(win)this.registerDomEvent(win,'blur',()=>void this.run(()=>this.savePendingEdits()));
+    if(win)this.registerDomEvent(win,'blur',()=>{this.spacePanning=false;this.middlePan=undefined;this.stage?.removeClass('pb-space-pan');void this.run(()=>this.savePendingEdits());});
     this.registerDomEvent(doc,'visibilitychange',()=>{if(doc.hidden)void this.run(()=>this.savePendingEdits());});
-    this.registerEvent(this.app.workspace.on('css-change',()=>{this.uiTheme=undefined;for(const s of this.surfaces)if(s.visible)this.paintUI(s);}));
+    this.registerEvent(this.app.workspace.on('css-change',()=>{this.uiTheme=undefined;if(this.infinite)this.scheduleInfiniteRender(true);else for(const s of this.surfaces)if(s.visible)this.paintUI(s);}));
     this.registerDomEvent(this.contentEl,'keydown',e=>this.key(e));
+    this.registerDomEvent(this.contentEl,'keyup',e=>{if(e.code==='Space'&&this.spacePanning){this.spacePanning=false;this.stage?.removeClass('pb-space-pan');}});
     this.registerDomEvent(this.contentEl,'paste',e=>void this.pasteEvent(e));
     this.registerDomEvent(this.contentEl,'dragover',e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();this.root?.addClass('pb-drop');}});
     this.registerDomEvent(this.contentEl,'dragleave',()=>this.root?.removeClass('pb-drop'));
     this.registerDomEvent(this.contentEl,'drop',e=>{this.root?.removeClass('pb-drop');if(e.dataTransfer?.files.length){e.preventDefault();const files=Array.from(e.dataTransfer.files);void this.run(async()=>{for(const f of files)await this.importFile(f);});}});
-    this.resizeObserver=new ResizeObserver(()=>{if(this.zoom<=0)this.fit();this.updateToolbarEdges();});this.resizeObserver.observe(this.contentEl);
+    this.resizeObserver=new ResizeObserver(()=>{if(this.infinite)this.scheduleInfiniteRender(true);else if(this.zoom<=0)this.fit();this.updateToolbarEdges();});this.resizeObserver.observe(this.contentEl);
     this.register(()=>this.resizeObserver?.disconnect());
   }
-  async onClose(){rememberAnchor(null);if(this.laserFrame!==undefined)cancelAnimationFrame(this.laserFrame);this.laserFrame=undefined;this.laserTrail=undefined;await this.savePendingEdits();this.releaseSurfaces();this.thumbsController?.abort();this.undoStack=[];this.redoStack=[];this.snapshots.clear();this.thumbPainters.clear();this.pageCards.clear();this.sidebarItems.clear();this.pendingThumbs.clear();this.uiTheme=undefined;this.backgroundEraser.stop();this.closed=true;this.renderEpoch++;this.thumbEpoch++;this.pageObservers.forEach(o=>o.disconnect());this.thumbObservers.forEach(o=>o.disconnect());await this.pdfs.clear();this.renderer.clear();}
+  async onClose(){rememberAnchor(null);if(this.laserFrame!==undefined)cancelAnimationFrame(this.laserFrame);this.laserFrame=undefined;this.laserTrail=undefined;if(this.infiniteFrame!==undefined){cancelAnimationFrame(this.infiniteFrame);this.infiniteFrame=undefined;}if(this.cameraSaveTimer!==undefined){window.clearTimeout(this.cameraSaveTimer);this.cameraSaveTimer=undefined;}this.spacePanning=false;this.middlePan=undefined;await this.savePendingEdits();this.releaseSurfaces();this.thumbsController?.abort();this.undoStack=[];this.redoStack=[];this.snapshots.clear();this.thumbPainters.clear();this.pageCards.clear();this.sidebarItems.clear();this.pendingThumbs.clear();this.uiTheme=undefined;this.backgroundEraser.stop();this.closed=true;this.renderEpoch++;this.thumbEpoch++;this.pageObservers.forEach(o=>o.disconnect());this.thumbObservers.forEach(o=>o.disconnect());await this.pdfs.clear();this.renderer.clear();}
   async onUnloadFile(file:TFile){await this.savePendingEdits();await super.onUnloadFile(file);}
-  private async savePendingEdits(){this.inlineEditor?.finish(true);await this.finishGesture(true);await this.flush();}
+  private async savePendingEdits(){this.inlineEditor?.finish(true);await this.finishGesture(true);if(this.infinite&&this.valid)this.syncViewportToBook();await this.flush();}
   private async run(fn:()=>void|Promise<void>){try{await fn();}catch(error){if(error instanceof Error&&['AbortError','RenderingCancelledException'].includes(error.name))return;console.error('Penbook',error);new Notice(`Penbook：${error instanceof Error?error.message:String(error)}`);}}
   private snapshot():Snapshot{return this.snapshots.capture(this.book);}
   private trimHistory(){while(this.undoStack.length>1&&(this.undoStack.length+this.redoStack.length>50||historyWeight([...this.undoStack,...this.redoStack])>64*1024*1024))this.undoStack.shift();while(this.redoStack.length>1&&(this.undoStack.length+this.redoStack.length>50||historyWeight([...this.undoStack,...this.redoStack])>64*1024*1024))this.redoStack.shift();}
@@ -118,10 +131,14 @@ export class PenbookView extends TextFileView {
   get page(){return this.book.pages[this.index];}
   async undo(){await this.finishGesture(true);const b=this.undoStack.pop();if(!b)return;this.redoStack.push(this.snapshot());this.trimHistory();Object.assign(this.book,clone(b));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();this.changed();this.render(true);}
   async redo(){await this.finishGesture(true);const b=this.redoStack.pop();if(!b)return;this.undoStack.push(this.snapshot());this.trimHistory();Object.assign(this.book,clone(b));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();this.changed();this.render(true);}
-  navigate(delta:number){this.goTo(Math.max(0,Math.min(this.book.pages.length-1,this.index+delta)));}
-  goToId(id:string){const i=this.book.pages.findIndex(p=>p.id===id);if(i>=0)this.goTo(i);}
-  private goTo(i:number){this.finishGesture(true);this.index=i;this.selection.clear();if(this.layout==='continuous'){this.surfaces.forEach(s=>s.sheet.toggleClass('is-active',s.page.id===this.page.id));this.surfaces.find(s=>s.page.id===this.page.id)?.sheet.scrollIntoView({block:'start',behavior:'smooth'});this.drawSidebar();this.drawFooter();this.updateSelectionBar();}else this.render();}
-  render(preserveScroll=false){if(!this.valid||this.closed)return;const scroll=preserveScroll&&this.stage?{left:this.stage.scrollLeft,top:this.stage.scrollTop}:undefined,hidden=this.root?.hasClass('pb-sidebar-hidden')??false,immersive=this.root?.hasClass('pb-immersive')??false;this.releaseSurfaces();this.renderEpoch++;this.contentEl.empty();this.surfaces=[];this.root=this.contentEl.createDiv('pb-root');this.root.toggleClass('pb-sidebar-hidden',hidden);this.root.toggleClass('pb-immersive',immersive);this.root.toggleClass('pb-left',this.plugin.settings.leftHanded);this.root.toggleClass('pb-bottom',this.plugin.settings.toolbarBottom);this.root.tabIndex=0;
+  navigate(delta:number){if(this.infinite)return;this.goTo(Math.max(0,Math.min(this.book.pages.length-1,this.index+delta)));}
+  goToId(id:string){if(this.infinite){if(this.book.bookmarks?.some(b=>b.id===id)){this.goToBookmarkId(id);return;}const target=this.page.items.find(o=>o.id===id);if(target)this.focusItem(target);return;}const i=this.book.pages.findIndex(p=>p.id===id);if(i>=0)this.goTo(i);}
+  goToBookmarkId(id:string){const bm=this.book.bookmarks?.find(b=>b.id===id);if(!bm)return;this.finishGesture(true);this.setInfiniteCamera({x:bm.x,y:bm.y,zoom:bm.zoom});this.drawSidebar();new Notice(`已跳转到视角书签：${bm.title}`);}
+  private goTo(i:number){if(this.infinite)return;this.finishGesture(true);this.index=i;this.selection.clear();if(this.layout==='continuous'){this.surfaces.forEach(s=>s.sheet.toggleClass('is-active',s.page.id===this.page.id));this.surfaces.find(s=>s.page.id===this.page.id)?.sheet.scrollIntoView({block:'start',behavior:'smooth'});this.drawSidebar();this.drawFooter();this.updateSelectionBar();}else this.render();}
+  render(preserveScroll=false){if(!this.valid||this.closed)return;
+    const isInitialInfinite=this.infinite&&this.sidebarInitBook!==this.book;
+    if(isInitialInfinite)this.sidebarInitBook=this.book;
+    const scroll=preserveScroll&&this.stage?{left:this.stage.scrollLeft,top:this.stage.scrollTop}:undefined,hidden=isInitialInfinite?true:(this.root?.hasClass('pb-sidebar-hidden')??false),immersive=this.root?.hasClass('pb-immersive')??false;this.releaseSurfaces();this.renderEpoch++;this.contentEl.empty();this.surfaces=[];this.root=this.contentEl.createDiv('pb-root');this.root.toggleClass('pb-sidebar-hidden',hidden);this.root.toggleClass('pb-immersive',immersive);this.root.toggleClass('pb-left',this.plugin.settings.leftHanded);this.root.toggleClass('pb-bottom',this.plugin.settings.toolbarBottom);this.root.tabIndex=0;
     this.toolbarWrap=this.root.createDiv('pb-toolbar-row');this.toolbarWrap.setAttribute('role','toolbar');this.toolbarWrap.setAttribute('aria-label','笔记本工具栏');
     this.toolbarLeft=this.toolbarWrap.createDiv('pb-toolbar pb-toolbar-fixed');
     this.toolbarScrollWrap=this.toolbarWrap.createDiv('pb-toolbar-wrap pb-toolbar-center');this.toolbar=this.toolbarScrollWrap.createDiv('pb-toolbar');this.toolbar.setAttribute('role','toolbar');this.toolbar.setAttribute('aria-label','书写工具，左右滑动查看更多');
@@ -132,10 +149,26 @@ export class PenbookView extends TextFileView {
     this.contextWrap=this.contextRow.createDiv('pb-toolbar-wrap pb-context-wrap');this.contextEl=this.contextWrap.createDiv('pb-tool-context');this.contextEl.setAttribute('role','toolbar');this.contextEl.setAttribute('aria-label','当前工具设置');
     this.contextEl.addEventListener('scroll',()=>this.updateToolbarEdges(),{passive:true});this.contextEl.addEventListener('wheel',e=>{if(Math.abs(e.deltaY)>Math.abs(e.deltaX)&&this.contextEl.scrollWidth>this.contextEl.clientWidth){e.preventDefault();this.contextEl.scrollLeft+=e.deltaY;}},{passive:false});
     this.drawToolbar();
-    const workspace=this.root.createDiv('pb-workspace');this.sidebar=workspace.createDiv('pb-sidebar');this.stage=workspace.createDiv('pb-stage');this.pagesEl=this.stage.createDiv('pb-pages');this.footer=this.root.createDiv('pb-footer');
-    this.stage.addEventListener('scroll',()=>{this.queuePageTracking();const s=this.surfaces.find(s=>s.page===this.page);if(s&&this.selection.size)this.paintUI(s,undefined,this.gesture?.tool==='lasso'&&!this.gesture.mode?this.gesture.points:undefined);},{passive:true});
+    const workspace=this.root.createDiv('pb-workspace');this.sidebar=workspace.createDiv('pb-sidebar');this.stage=workspace.createDiv('pb-stage');this.stage.toggleClass('pb-infinite',this.infinite);this.stage.toggleClass('pb-space-pan',this.infinite&&this.spacePanning);this.pagesEl=this.stage.createDiv('pb-pages');this.footer=this.root.createDiv('pb-footer');
+    this.stage.addEventListener('scroll',()=>{if(this.infinite)return;this.queuePageTracking();const s=this.surfaces.find(s=>s.page===this.page);if(s&&this.selection.size)this.paintUI(s,undefined,this.gesture?.tool==='lasso'&&!this.gesture.mode?this.gesture.points:undefined);},{passive:true});
     this.drawSidebar();this.drawPages();this.drawFooter();this.updateSelectionBar();
-    this.stage.addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey){e.preventDefault();this.setZoom(this.zoom*(e.deltaY>0?.9:1.1));}},{passive:false});if(scroll)requestAnimationFrame(()=>{if(this.stage?.isConnected){this.stage.scrollLeft=scroll.left;this.stage.scrollTop=scroll.top;}});
+    this.stage.addEventListener('wheel',e=>this.handleStageWheel(e),{passive:false});if(!this.infinite&&scroll)requestAnimationFrame(()=>{if(this.stage?.isConnected){this.stage.scrollLeft=scroll.left;this.stage.scrollTop=scroll.top;}});
+  }
+  private handleStageWheel(e:WheelEvent){
+    if(this.infinite){
+      e.preventDefault();
+      if(e.ctrlKey||e.metaKey){
+        const rect=this.stage.getBoundingClientRect();
+        const factor=e.deltaMode===1?(e.deltaY>0?.9:1.1):Math.max(.75,Math.min(1.33,Math.exp(-e.deltaY*.002)));
+        this.setInfiniteCamera(zoomAtScreenPoint(this.camera,this.camera.zoom*factor,e.clientX-rect.left,e.clientY-rect.top,this.stageSize()));
+      }else{
+        const horizontal=e.shiftKey&&Math.abs(e.deltaX)<.5;
+        const dx=horizontal?e.deltaY:e.deltaX,dy=horizontal?0:e.deltaY;
+        this.setInfiniteCamera({...this.camera,x:this.camera.x+dx/this.camera.zoom,y:this.camera.y+dy/this.camera.zoom});
+      }
+      return;
+    }
+    if(e.ctrlKey||e.metaKey){e.preventDefault();this.setZoom(this.zoom*(e.deltaY>0?.9:1.1));}
   }
   private button(parent:HTMLElement,label:string,title:string,fn:()=>void|Promise<void>,active=false){const action=SHORTCUTS.find(([,name])=>name===title||name===`${title}工具`),hint=action&&shortcutHint(action[0]);const b=parent.createEl('button',{cls:'pb-button',attr:{title:hint?`${title}（${hint}）`:title,'aria-label':title}});if(label)icon(b,actionIcon(title));b.toggleClass('is-active',active);b.setAttribute('aria-pressed',String(active));b.onclick=()=>{if(dismissPopoverFor(b))return;b.focus({preventScroll:true});rememberAnchor(b);void this.run(fn);};return b;}
   private select<T extends string>(parent:HTMLElement,values:Record<T,string>,value:T,fn:(v:T)=>void){const s=parent.createEl('select');for(const [v,text]of Object.entries(values))s.createEl('option',{text:String(text),value:v});s.value=value;s.onchange=()=>fn(s.value as T);return s;}
@@ -150,7 +183,13 @@ export class PenbookView extends TextFileView {
     for(const[t,name]of[['tape','胶带'],['link','链接'],['table','表格'],['hand','平移']]as[Tool,string][]){const b=this.button(this.toolbar,t==='tape'?'':name,name,()=>{if(t==='tape'&&this.tool===t)this.tapePanel(b);else this.setTool(t);},this.tool===t);if(t==='tape')pathIcon(b,UI_ICONS.tape,22);this.penButtons.set(t,b);}
     this.button(this.toolbar,'阅读','阅读模式',()=>{this.finishGesture(true);this.reading=!this.reading;this.drawPages();this.drawToolbar();},this.reading);
     this.button(this.historyEl,'↶','撤销（Ctrl/Cmd+Z）',()=>this.undo());this.button(this.historyEl,'↷','重做（Ctrl/Cmd+Shift+Z）',()=>this.redo());this.updateHistory();
-    this.button(this.toolbarRight,'＋','插入页面',()=>this.addPage());this.button(this.toolbarRight,'导出','导出 PDF、PNG、SVG 或 Markdown 索引',()=>this.exportMenu());
+    if(this.infinite){
+      this.button(this.toolbarRight,'参考线','显示或隐藏 A4 分页参考虚线',()=>this.toggleGuides(),this.showGuides);
+      this.button(this.toolbarRight,'导入','导入 PDF 或图片到画布',()=>this.importMenu());
+    }else{
+      this.button(this.toolbarRight,'＋','插入页面',()=>this.addPage());
+    }
+    this.button(this.toolbarRight,'导出','导出 PDF、PNG、SVG 或 Markdown 索引',()=>this.exportMenu());
     this.button(this.toolbarRight,'⋯','笔记本与页面选项',()=>this.moreMenu());
     this.drawContext();
     requestAnimationFrame(()=>{if(!this.toolbar.isConnected)return;this.toolbar.scrollLeft=scroll;this.updateToolbarEdges();});
@@ -226,6 +265,8 @@ export class PenbookView extends TextFileView {
   private contrast(hex:string){const n=parseInt(hex.replace('#',''),16);return(((n>>16)&255)*.299+((n>>8)&255)*.587+(n&255)*.114)>150?'#000000':'#ffffff';}
   private setTool(tool:Tool){this.finishGesture(true);if(tool==='eraser'&&this.tool!=='eraser')this.previousTool=this.tool;if(tool!=='lasso'&&tool!=='text')this.selection.clear();this.tool=tool;this.reading=false;for(const[t,b]of this.penButtons){b.toggleClass('is-active',t===tool);b.setAttribute('aria-pressed',String(t===tool));}for(const s of this.surfaces)s.sheet.toggleClass('is-reading',tool==='hand');this.drawContext();this.drawFooter();this.updateSelectionBar();this.repaint();}
   private drawSidebar(){
+    if(this.infinite){this.drawInfiniteSidebar();return;}
+    this.sidebar?.removeClass('pb-infinite-sidebar');
     const structure=JSON.stringify([this.sidebarQuery,this.book.pages.map(p=>[p.id,p.title,p.locked,p.bookmark,p.width,p.height,p.tags,p.paper,p.color,p.spacing,p.background,p.backgroundRotation])]);
     if(!this.sidebarQuery&&this.sidebar===this.sidebarElement&&structure===this.sidebarStructure){for(const[id,card]of this.pageCards)card.toggleClass('is-active',id===this.page.id);this.pendingThumbs.add(this.page.id);for(const p of this.book.pages){const old=this.sidebarItems.get(p.id);if(!old||old.items!==p.items||old.length!==p.items.length){this.pendingThumbs.add(p.id);this.sidebarItems.set(p.id,{items:p.items,length:p.items.length});}}if(this.thumbFrame===undefined)this.thumbFrame=requestAnimationFrame(()=>{this.thumbFrame=undefined;for(const id of this.pendingThumbs)this.thumbPainters.get(id)?.();this.pendingThumbs.clear();});return;}
     this.sidebarStructure=structure;this.sidebarElement=this.sidebar;this.thumbPainters.clear();this.pageCards.clear();this.sidebarItems.clear();this.pendingThumbs.clear();if(this.thumbFrame!==undefined)cancelAnimationFrame(this.thumbFrame);this.thumbFrame=undefined;
@@ -249,21 +290,198 @@ export class PenbookView extends TextFileView {
     });
     this.button(this.sidebar,'＋ 添加页面','添加页面',()=>this.addPage()).addClass('pb-sidebar-add');
   }
+  private drawInfiniteSidebar(){
+    if(!this.sidebar)return;
+    let body=this.sidebar.querySelector<HTMLElement>('.pb-infinite-sidebar-body');
+    if(!body||!this.sidebar.hasClass('pb-infinite-sidebar')){
+      this.sidebar.empty();
+      this.sidebar.addClass('pb-infinite-sidebar');
+      const search=this.sidebar.createEl('input',{attr:{type:'search',placeholder:'搜索书签与画布内容',value:this.sidebarQuery}});
+      search.oninput=()=>{this.sidebarQuery=search.value;this.drawInfiniteSidebar();};
+      body=this.sidebar.createDiv('pb-infinite-sidebar-body');
+    }else{
+      const input=this.sidebar.querySelector<HTMLInputElement>('input[type=search]');
+      if(input&&input.value!==this.sidebarQuery)input.value=this.sidebarQuery;
+    }
+    body.empty();
+    const query=this.sidebarQuery.trim().toLowerCase();
+    const bmHeader=body.createDiv('pb-sidebar-section-header');
+    bmHeader.createSpan({text:'视角书签'});
+    const addBtn=bmHeader.createEl('button',{cls:'pb-panel-icon',attr:{title:'添加视角书签','aria-label':'添加视角书签'}});
+    icon(addBtn,'plus',15);
+    addBtn.onclick=()=>void this.run(()=>this.addViewportBookmark());
+
+    const bookmarks=(this.book.bookmarks??[]).filter(b=>!query||b.title.toLowerCase().includes(query));
+    if(!bookmarks.length){
+      body.createDiv({cls:'pb-sidebar-empty',text:query?'无匹配视角书签':'暂无视角书签，点击 + 记录当前视角'});
+    }else{
+      for(const bm of bookmarks){
+        const card=body.createDiv('pb-bookmark-card');
+        const main=card.createEl('button',{cls:'pb-bookmark-main'});
+        main.createEl('strong',{text:bm.title});
+        main.createEl('small',{text:`(${Math.round(bm.x)}, ${Math.round(bm.y)}) · ${Math.round(bm.zoom*100)}%`});
+        main.onclick=()=>this.goToBookmarkId(bm.id);
+        const actions=card.createDiv('pb-bookmark-actions');
+        const act=(iconName:Parameters<typeof icon>[1],title:string,fn:()=>void|Promise<void>)=>{
+          const b=actions.createEl('button',{cls:'pb-panel-icon',attr:{title,'aria-label':title}});
+          icon(b,iconName,14);
+          b.onclick=e=>{e.stopPropagation();void this.run(fn);};
+        };
+        act('origin','更新为当前视角',()=>{bm.x=Math.round(this.camera.x*100)/100;bm.y=Math.round(this.camera.y*100)/100;bm.zoom=clampInfiniteZoom(this.camera.zoom);this.changed();this.drawInfiniteSidebar();new Notice(`已更新书签：${bm.title}`);});
+        act('edit','重命名书签',async()=>{const v=await form(this.app,'重命名视角书签',[{key:'title',name:'名称',value:bm.title}]);if(!v||!v.title.trim())return;bm.title=v.title.trim();this.changed();this.drawInfiniteSidebar();});
+        act('link','复制书签链接',async()=>{if(!this.file)return;const url=`obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file.path)}&bookmark=${encodeURIComponent(bm.id)}`;await navigator.clipboard.writeText(`[${this.book.title} · ${bm.title}](${url})`);new Notice('书签链接已复制');});
+        act('delete','删除书签',()=>{this.book.bookmarks=(this.book.bookmarks??[]).filter(x=>x.id!==bm.id);this.changed();this.drawInfiniteSidebar();});
+      }
+    }
+
+    const contentHeader=body.createDiv('pb-sidebar-section-header');
+    contentHeader.createSpan({text:'画布内容'});
+    const searchable=this.page.items.filter(o=>['text','sticky','link','table'].includes(o.kind));
+    const matches=searchable.map(o=>{
+      const rawText=o.kind==='table'?(o.cells??[]).flat().join(' '):o.kind==='link'?`${o.text??''} ${o.target??''}`:(o.text??'');
+      return{o,text:rawText.trim()};
+    }).filter(entry=>entry.text&&(!query||entry.text.toLowerCase().includes(query)));
+    if(!matches.length){
+      body.createDiv({cls:'pb-sidebar-empty',text:query?'无匹配文本、便签或链接':'画布中暂无文本/便签/链接'});
+    }else{
+      for(const {o,text} of matches){
+        const kindLabel=o.kind==='sticky'?'便签':o.kind==='link'?'链接':o.kind==='table'?'表格':'文本';
+        const hit=body.createEl('button',{cls:'pb-search-hit'});
+        hit.createSpan({cls:'pb-search-kind',text:kindLabel});
+        hit.createSpan({cls:'pb-search-snippet',text:text.slice(0,60)});
+        hit.onclick=()=>this.focusItem(o);
+      }
+    }
+  }
   private drawFooter(){
-    if(!this.footer)return;this.footer.empty();this.button(this.footer,'‹','上一页',()=>this.navigate(-1));
+    if(!this.footer)return;this.footer.empty();
+    if(this.infinite){
+      this.button(this.footer,'−','缩小',()=>this.setZoom(this.camera.zoom/1.2));
+      this.zoomLabelEl=this.footer.createEl('button',{cls:'pb-button pb-footer-zoom',text:`${Math.round(this.camera.zoom*100)}%`,attr:{title:'缩放至 100%','aria-label':'缩放至 100%'}});
+      this.zoomLabelEl.onclick=()=>this.setZoom(1);
+      this.button(this.footer,'＋','放大',()=>this.setZoom(this.camera.zoom*1.2));
+      this.button(this.footer,'适应全部','适应全部内容',()=>this.fit());
+      this.button(this.footer,'原点','回到原点 (0, 0, 100%)',()=>this.resetOrigin());
+      this.button(this.footer,'书签','添加视角书签',()=>this.addViewportBookmark());
+      this.button(this.footer,'小地图','显示或隐藏小地图',()=>this.toggleMinimap(),this.minimapVisible);
+      this.coordLabelEl=this.footer.createSpan({cls:'pb-status pb-infinite-coords',text:`(${Math.round(this.camera.x)}, ${Math.round(this.camera.y)})`});
+      return;
+    }
+    this.zoomLabelEl=undefined;this.coordLabelEl=undefined;
+    this.button(this.footer,'‹','上一页',()=>this.navigate(-1));
     const page=this.footer.createEl('input',{attr:{type:'number',min:'1',max:String(this.book.pages.length),value:String(this.index+1),title:'跳转到页码'}});page.onchange=()=>this.goTo(Math.max(0,Math.min(this.book.pages.length-1,Number(page.value)-1||0)));
     this.footer.createSpan({text:`/ ${this.book.pages.length}`});this.button(this.footer,'›','下一页',()=>this.navigate(1));
     this.select(this.footer,{single:'单页',continuous:'连续滚动',spread:'双页'},this.layout,v=>{this.layout=v;this.drawPages();});
     this.button(this.footer,'−','缩小',()=>this.setZoom(this.zoom/1.2));this.footer.createSpan({text:`${Math.round(this.zoom*100)}%`});this.button(this.footer,'＋','放大',()=>this.setZoom(this.zoom*1.2));this.button(this.footer,'适宽','适合宽度',()=>this.fit());
   }
-  private fit(){if(!this.stage)return;this.setZoom(Math.max(.1,(this.stage.clientWidth-48)/(this.layout==='spread'?this.page.width*2+24:this.page.width)));}
-  private setZoom(value:number){this.finishGesture(true);const old=this.zoom;this.zoom=Math.max(.15,Math.min(4,value));if(Math.abs(this.zoom-old)<.001)return;
-    const cx=(this.stage.scrollLeft+this.stage.clientWidth/2)/old,cy=(this.stage.scrollTop+this.stage.clientHeight/2)/old;this.drawPages();this.stage.scrollLeft=cx*this.zoom-this.stage.clientWidth/2;this.stage.scrollTop=cy*this.zoom-this.stage.clientHeight/2;this.drawFooter();}
+  private stageSize():Size{return{w:Math.max(1,this.stage?.clientWidth||800),h:Math.max(1,this.stage?.clientHeight||600)};}
+  private infiniteDpr(view:Size){const dpr=typeof window!=='undefined'?window.devicePixelRatio||1:1;return Math.min(2,Math.max(1,dpr),Math.sqrt(8_000_000/Math.max(1,view.w*view.h)));}
+  private syncViewportToBook(){
+    if(!this.infinite||!this.valid)return;
+    const next={x:Math.round(this.camera.x*100)/100,y:Math.round(this.camera.y*100)/100,zoom:clampInfiniteZoom(this.camera.zoom),showGuides:this.showGuides};
+    const old=this.book.viewport;
+    if(old&&old.x===next.x&&old.y===next.y&&Math.abs(old.zoom-next.zoom)<1e-4&&Boolean(old.showGuides)===next.showGuides)return;
+    this.book.viewport=next;this.book.modified=new Date().toISOString();this.dirty=true;
+  }
+  private persistViewport(){
+    if(!this.infinite||!this.valid)return;
+    this.syncViewportToBook();
+    if(this.cameraSaveTimer!==undefined)window.clearTimeout(this.cameraSaveTimer);
+    this.cameraSaveTimer=window.setTimeout(()=>{this.cameraSaveTimer=undefined;void this.flush();},800);
+  }
+  private updateInfiniteFooterStatus(){
+    if(this.zoomLabelEl)this.zoomLabelEl.setText(`${Math.round(this.camera.zoom*100)}%`);
+    if(this.coordLabelEl)this.coordLabelEl.setText(`(${Math.round(this.camera.x)}, ${Math.round(this.camera.y)})`);
+  }
+  private setInfiniteCamera(next:Camera){
+    const clamped:Camera={x:Number.isFinite(next.x)?next.x:0,y:Number.isFinite(next.y)?next.y:0,zoom:clampInfiniteZoom(next.zoom)};
+    this.camera=clamped;this.zoom=clamped.zoom;
+    this.updateInfiniteFooterStatus();
+    this.scheduleInfiniteRender(true);
+    this.persistViewport();
+  }
+  private scheduleInfiniteRender(redrawBg=false){
+    if(!this.infinite||this.closed)return;
+    if(this.infiniteFrame!==undefined)return;
+    this.infiniteFrame=requestAnimationFrame(()=>{this.infiniteFrame=undefined;this.renderInfiniteFrame(redrawBg);});
+  }
+  private renderInfiniteFrame(redrawBg=true){
+    const s=this.surfaces[0];if(!this.infinite||!s||!this.stage?.isConnected)return;
+    const view=this.stageSize(),dpr=this.infiniteDpr(view),pw=Math.max(1,Math.round(view.w*dpr)),ph=Math.max(1,Math.round(view.h*dpr));
+    const resized=s.bg.width!==pw||s.bg.height!==ph;
+    if(resized)for(const c of[s.bg,s.ink,s.ui]){c.width=pw;c.height=ph;}
+    if(redrawBg||resized){const bctx=s.bg.getContext('2d');if(bctx)drawInfiniteBackground(bctx,s.page,this.camera,view,this.showGuides,dpr,true);}
+    void this.paint(s);
+    this.inlineReposition?.();
+    this.paintMinimap();
+  }
+  private resetOrigin(){if(!this.infinite)return;this.finishGesture(true);this.setInfiniteCamera({x:0,y:0,zoom:1});}
+  private toggleGuides(){if(!this.infinite)return;this.showGuides=!this.showGuides;this.syncViewportToBook();this.persistViewport();this.drawToolbar();this.renderInfiniteFrame(true);}
+  private toggleMinimap(){if(!this.infinite)return;this.minimapVisible=!this.minimapVisible;this.minimapEl?.toggleClass('is-hidden',!this.minimapVisible);this.drawFooter();if(this.minimapVisible)this.paintMinimap();}
+  private async addViewportBookmark(title?:string){
+    if(!this.infinite)return;
+    let name=title;
+    if(name===undefined){
+      const defaultName=`视角 ${(this.book.bookmarks?.length??0)+1}`;
+      const v=await form(this.app,'添加视角书签',[{key:'title',name:'书签名称',value:defaultName}]);
+      if(!v)return;
+      name=v.title.trim()||defaultName;
+    }
+    const bm:ViewportBookmark={id:uid(),title:name,x:Math.round(this.camera.x*100)/100,y:Math.round(this.camera.y*100)/100,zoom:clampInfiniteZoom(this.camera.zoom)};
+    (this.book.bookmarks??=[]).push(bm);this.changed();this.drawSidebar();new Notice(`已添加书签：${bm.title}`);
+  }
+  private focusItem(o:Item){
+    const b=itemAABB(o,0);
+    this.finishGesture(true);
+    this.setInfiniteCamera({x:b.x+b.w/2,y:b.y+b.h/2,zoom:Math.max(.6,Math.min(2,this.camera.zoom))});
+    this.selection=new Set([o.id]);this.setTool('lasso');
+  }
+  private fit(){
+    if(!this.stage)return;
+    if(this.infinite){this.finishGesture(true);this.setInfiniteCamera(fitCameraToBounds(contentBounds(this.page.items,32),this.stageSize(),48));return;}
+    this.setZoom(Math.max(.1,(this.stage.clientWidth-48)/(this.layout==='spread'?this.page.width*2+24:this.page.width)));
+  }
+  private setZoom(value:number,anchor?:[number,number]){
+    if(this.infinite){
+      this.finishGesture(true);
+      const view=this.stageSize(),sx=anchor?anchor[0]:view.w/2,sy=anchor?anchor[1]:view.h/2;
+      this.setInfiniteCamera(zoomAtScreenPoint(this.camera,value,sx,sy,view));
+      return;
+    }
+    this.finishGesture(true);const old=this.zoom;this.zoom=Math.max(.15,Math.min(4,value));if(Math.abs(this.zoom-old)<.001)return;
+    const cx=(this.stage.scrollLeft+this.stage.clientWidth/2)/old,cy=(this.stage.scrollTop+this.stage.clientHeight/2)/old;this.drawPages();this.stage.scrollLeft=cx*this.zoom-this.stage.clientWidth/2;this.stage.scrollTop=cy*this.zoom-this.stage.clientHeight/2;this.drawFooter();
+  }
+  private bindSurfaceEvents(s:Surface){
+    const {ui,page:p}=s;
+    ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;s.sheet.removeClass('is-panning');return;}const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
+    ui.addEventListener('contextmenu',e=>{e.preventDefault();if(this.lastPointerType==='pen'||this.penHoldFired){this.penHoldFired=false;return;}this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
+    let press:{x:number;y:number}|undefined;
+    ui.addEventListener('pointerdown',e=>press={x:e.clientX,y:e.clientY});
+    ui.addEventListener('click',e=>{if(this.inlineEditor){e.stopPropagation();queueMicrotask(()=>document.querySelector<HTMLElement>('.pb-inline-text')?.focus({preventScroll:true}));return;}if(press&&(this.reading||this.tool==='hand')&&Math.hypot(e.clientX-press.x,e.clientY-press.y)<6){const point=this.point(e,s);const link=p.pdfLinks?.find(l=>point[0]>=l.x&&point[0]<=l.x+l.w&&point[1]>=l.y&&point[1]<=l.y+l.h);if(link){void this.run(()=>link.page?Promise.resolve(this.goToId(link.page)):this.openLink(link.url??''));return;}const itemLink=[...p.items].reverse().find(o=>o.kind==='link'&&contains(o,point[0],point[1]));if(itemLink)void this.run(()=>this.openLink(itemLink.target??''));}});
+  }
   private drawPages(){
     this.releaseSurfaces();
     this.pageObservers.forEach(o=>o.disconnect());this.pageObservers=[];
     for(const s of this.surfaces)if(s.ui.parentElement===this.stage)s.ui.remove();
-    this.renderEpoch++;const epoch=this.renderEpoch;this.pagesEl.empty();this.pagesEl.toggleClass('pb-spread',this.layout==='spread');this.pagesEl.toggleClass('pb-horizontal',this.layout==='continuous'&&this.plugin.settings.scrollDirection==='horizontal');this.surfaces=[];
+    this.minimapEl?.remove();this.minimapEl=undefined;this.minimapCanvas=undefined;
+    this.renderEpoch++;const epoch=this.renderEpoch;this.pagesEl.empty();
+    if(this.infinite){
+      this.index=0;this.surfaces=[];this.stage?.addClass('pb-infinite');
+      this.pagesEl.removeClass('pb-spread');this.pagesEl.removeClass('pb-horizontal');this.pagesEl.addClass('pb-pages-infinite');
+      const p=this.page,sheet=this.pagesEl.createDiv('pb-sheet pb-infinite-sheet is-active');
+      sheet.toggleClass('is-reading',this.reading||this.tool==='hand');
+      const bg=sheet.createEl('canvas',{cls:'pb-bg'}),ink=sheet.createEl('canvas',{cls:'pb-ink'}),text=sheet.createDiv('pb-text-layer'),ui=sheet.createEl('canvas',{cls:'pb-interaction'});
+      const view=this.stageSize(),dpr=this.infiniteDpr(view),pw=Math.max(1,Math.round(view.w*dpr)),ph=Math.max(1,Math.round(view.h*dpr));
+      for(const c of[bg,ink,ui]){c.width=pw;c.height=ph;}
+      const s:Surface={page:p,sheet,bg,ink,ui,text,epoch,visible:true,backgroundReady:true};
+      this.surfaces.push(s);
+      this.bindSurfaceEvents(s);
+      this.mountMinimap();
+      this.renderInfiniteFrame(true);
+      return;
+    }
+    this.stage?.removeClass('pb-infinite');this.pagesEl.removeClass('pb-pages-infinite');
+    this.pagesEl.toggleClass('pb-spread',this.layout==='spread');this.pagesEl.toggleClass('pb-horizontal',this.layout==='continuous'&&this.plugin.settings.scrollDirection==='horizontal');this.surfaces=[];
     const pages=this.layout==='continuous'?this.book.pages:this.layout==='spread'?this.book.pages.slice(Math.floor(this.index/2)*2,Math.floor(this.index/2)*2+2):[this.page];
     const loaders=new Map<Element,{surface:Surface;paint:()=>void}>(),observer=this.layout==='continuous'?new IntersectionObserver(entries=>{for(const entry of entries){const loader=loaders.get(entry.target);if(!loader)continue;const s=loader.surface,p=s.page;if(entry.isIntersecting)loader.paint();else if(this.gesture?.surface!==s&&!(this.inlineEditingId&&p.items.some(o=>o.id===this.inlineEditingId))&&!(p===this.page&&this.selection.size))this.releaseSurface(s);}},{root:this.stage,rootMargin:'400px'}):undefined;if(observer)this.pageObservers.push(observer);
     for(const p of pages){
@@ -274,14 +492,64 @@ export class PenbookView extends TextFileView {
       const paint=()=>void this.run(async()=>{if(epoch!==this.renderEpoch||s.visible)return;s.visible=true;const controller=new AbortController();s.controller=controller;for(const c of[bg,ink,ui]){c.width=Math.max(1,Math.round(p.width*scale));c.height=Math.max(1,Math.round(p.height*scale));}await this.pdfs.background(bg,p,this.book,this.renderer,scale,controller.signal);if(epoch!==this.renderEpoch||controller.signal.aborted)return;s.backgroundReady=true;await this.paint(s);if(this.reading&&p.background&&this.book.resources[p.background.resource]?.type==='pdf')await this.pdfTextLayer(s);});
       if(p.id===this.page.id||this.layout!=='continuous')paint();
       if(observer){loaders.set(sheet,{surface:s,paint});observer.observe(sheet);}
-      ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
-      ui.addEventListener('contextmenu',e=>{e.preventDefault();if(this.lastPointerType==='pen'||this.penHoldFired){this.penHoldFired=false;return;}this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
-      let press:{x:number;y:number}|undefined;
-      ui.addEventListener('pointerdown',e=>press={x:e.clientX,y:e.clientY});
-      ui.addEventListener('click',e=>{if(this.inlineEditor){e.stopPropagation();queueMicrotask(()=>document.querySelector<HTMLElement>('.pb-inline-text')?.focus({preventScroll:true}));return;}if(press&&(this.reading||this.tool==='hand')&&Math.hypot(e.clientX-press.x,e.clientY-press.y)<6){const point=this.point(e,s),link=p.pdfLinks?.find(l=>point[0]>=l.x&&point[0]<=l.x+l.w&&point[1]>=l.y&&point[1]<=l.y+l.h);if(link)void this.run(()=>link.page?Promise.resolve(this.goToId(link.page)):this.openLink(link.url??''));}});
+      this.bindSurfaceEvents(s);
       text.addEventListener('pointerdown',()=>{this.index=this.book.pages.indexOf(p);});
     }
     this.queuePageTracking();
+  }
+  private mountMinimap(){
+    if(!this.infinite||!this.stage)return;
+    const box=this.stage.createDiv('pb-minimap');
+    box.toggleClass('is-hidden',!this.minimapVisible);
+    const canvas=box.createEl('canvas',{cls:'pb-minimap-canvas'});
+    const w=200,h=140,dpr=Math.min(2,window.devicePixelRatio||1);
+    canvas.width=w*dpr;canvas.height=h*dpr;
+    this.minimapEl=box;this.minimapCanvas=canvas;
+    const mapPoint=(clientX:number,clientY:number,bounds:Rect)=>{
+      const r=canvas.getBoundingClientRect();
+      const u=Math.max(0,Math.min(1,(clientX-r.left)/Math.max(1,r.width)));
+      const v=Math.max(0,Math.min(1,(clientY-r.top)/Math.max(1,r.height)));
+      return{x:bounds.x+u*bounds.w,y:bounds.y+v*bounds.h};
+    };
+    const minimapBounds=():Rect=>{
+      const cb=contentBounds(this.page.items,160),vr=visibleWorldRect(this.camera,this.stageSize(),40);
+      const boxes=[vr,{x:-200,y:-200,w:400,h:400}];if(cb)boxes.push(cb);
+      const minX=Math.min(...boxes.map(b=>b.x)),minY=Math.min(...boxes.map(b=>b.y)),maxX=Math.max(...boxes.map(b=>b.x+b.w)),maxY=Math.max(...boxes.map(b=>b.y+b.h));
+      const bw=Math.max(100,maxX-minX),bh=Math.max(100,maxY-minY);
+      const targetAspect=200/140;
+      if(bw/bh>targetAspect){const nh=bw/targetAspect;return{x:minX,y:minY-(nh-bh)/2,w:bw,h:nh};}
+      const nw=bh*targetAspect;return{x:minX-(nw-bw)/2,y:minY,w:nw,h:bh};
+    };
+    canvas.addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();canvas.setPointerCapture(e.pointerId);const bounds=minimapBounds();this.minimapDragging={pointerId:e.pointerId,bounds};const p=mapPoint(e.clientX,e.clientY,bounds);this.setInfiniteCamera({...this.camera,x:p.x,y:p.y});});
+    canvas.addEventListener('pointermove',e=>{if(this.minimapDragging?.pointerId!==e.pointerId)return;e.preventDefault();const p=mapPoint(e.clientX,e.clientY,this.minimapDragging.bounds);this.setInfiniteCamera({...this.camera,x:p.x,y:p.y});});
+    const endDrag=(e:PointerEvent)=>{if(this.minimapDragging?.pointerId===e.pointerId)this.minimapDragging=undefined;};
+    canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
+  }
+  private paintMinimap(){
+    if(!this.infinite||!this.minimapVisible||!this.minimapCanvas?.isConnected)return;
+    const c=this.minimapCanvas,ctx=c.getContext('2d');if(!ctx)return;
+    const w=200,h=140,dpr=c.width/w;
+    const cb=contentBounds(this.page.items,160),vr=visibleWorldRect(this.camera,this.stageSize(),40);
+    const boxes=[vr,{x:-200,y:-200,w:400,h:400}];if(cb)boxes.push(cb);
+    const minX=Math.min(...boxes.map(b=>b.x)),minY=Math.min(...boxes.map(b=>b.y)),maxX=Math.max(...boxes.map(b=>b.x+b.w)),maxY=Math.max(...boxes.map(b=>b.y+b.h));
+    let bw=Math.max(100,maxX-minX),bh=Math.max(100,maxY-minY),bx=minX,by=minY;
+    if(bw/bh>w/h){const nh=bw/(w/h);by-=(nh-bh)/2;bh=nh;}else{const nw=bh*(w/h);bx-=(nw-bw)/2;bw=nw;}
+    const scale=w/bw;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle=this.page.color||'#ffffff';ctx.fillRect(0,0,w,h);
+    ctx.save();ctx.scale(scale,scale);ctx.translate(-bx,-by);
+    // Origin marker
+    ctx.strokeStyle='#94a3b8aa';ctx.lineWidth=1/scale;ctx.beginPath();ctx.moveTo(-60,0);ctx.lineTo(60,0);ctx.moveTo(0,-60);ctx.lineTo(0,60);ctx.stroke();
+    for(const o of this.page.items){
+      ctx.fillStyle=o.kind==='sticky'?(o.backgroundColor??'#fff2a8'):o.color||'#7f6df2';
+      ctx.globalAlpha=o.kind==='stroke'?.7:.55;
+      ctx.fillRect(o.x,o.y,Math.max(2/scale,o.w),Math.max(2/scale,o.h));
+    }
+    ctx.globalAlpha=1;
+    const cur=visibleWorldRect(this.camera,this.stageSize(),0);
+    ctx.strokeStyle='#7f6df2';ctx.fillStyle='rgba(127,109,242,0.12)';ctx.lineWidth=1.5/scale;
+    ctx.fillRect(cur.x,cur.y,cur.w,cur.h);ctx.strokeRect(cur.x,cur.y,cur.w,cur.h);
+    ctx.restore();
   }
   private queuePageTracking(){if(this.pageScrollFrame!==undefined||this.layout!=='continuous')return;this.pageScrollFrame=requestAnimationFrame(()=>{this.pageScrollFrame=undefined;this.syncVisiblePage();});}
   private syncVisiblePage(){
@@ -310,15 +578,51 @@ export class PenbookView extends TextFileView {
     });
   }
   private async paint(s:Surface){
-    if(!s.visible||s.ink.width<=1)return;const version=s.paintVersion=(s.paintVersion??0)+1,items=[...s.page.items],ctx=s.ink.getContext('2d')!,epoch=s.epoch;const images=await Promise.all(items.map(o=>o.resource?(s.images?.get(o.resource)??this.renderer.image(o.resource,this.book).catch(()=>undefined)):undefined));if(epoch!==this.renderEpoch||version!==s.paintVersion||!s.visible||!s.sheet.isConnected)return;s.images=new Map(items.flatMap((o,i)=>o.resource&&images[i]?[[o.resource,images[i]!] as [string,HTMLImageElement]]:[]));
+    if(!s.visible||s.ink.width<=1)return;
+    const version=s.paintVersion=(s.paintVersion??0)+1,epoch=s.epoch;
+    if(this.infinite){
+      const view=this.stageSize(),dpr=s.ink.width/view.w,viewRect=visibleWorldRect(this.camera,view,48);
+      const items=filterVisibleItems(s.page.items,viewRect,this.plugin.settings.showResolved,this.inlineEditingId);
+      const missing=items.some(o=>o.resource&&!s.images?.get(o.resource)&&!this.renderer.cachedImage(o.resource));
+      const images=missing
+        ?await Promise.all(items.map(o=>o.resource?(s.images?.get(o.resource)??this.renderer.cachedImage(o.resource)??this.renderer.image(o.resource,this.book).catch(()=>undefined)):undefined))
+        :items.map(o=>o.resource?(s.images?.get(o.resource)??this.renderer.cachedImage(o.resource)):undefined);
+      if(epoch!==this.renderEpoch||version!==s.paintVersion||!s.visible||!s.sheet.isConnected)return;
+      s.images=new Map(items.flatMap((o,i)=>o.resource&&images[i]?[[o.resource,images[i]!] as [string,HTMLImageElement]]:[]));
+      const ctx=s.ink.getContext('2d')!;
+      ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,s.ink.width,s.ink.height);
+      ctx.save();ctx.setTransform(dpr,0,0,dpr,0,0);ctx.translate(view.w/2,view.h/2);ctx.scale(this.camera.zoom,this.camera.zoom);ctx.translate(-this.camera.x,-this.camera.y);
+      items.forEach((o,i)=>this.renderer.draw(ctx,o,images[i]));
+      ctx.restore();
+      this.paintUI(s);
+      this.paintMinimap();
+      return;
+    }
+    const items=[...s.page.items],ctx=s.ink.getContext('2d')!;const images=await Promise.all(items.map(o=>o.resource?(s.images?.get(o.resource)??this.renderer.image(o.resource,this.book).catch(()=>undefined)):undefined));if(epoch!==this.renderEpoch||version!==s.paintVersion||!s.visible||!s.sheet.isConnected)return;s.images=new Map(items.flatMap((o,i)=>o.resource&&images[i]?[[o.resource,images[i]!] as [string,HTMLImageElement]]:[]));
     ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,s.ink.width,s.ink.height);ctx.scale(s.ink.width/s.page.width,s.ink.height/s.page.height);items.forEach((o,i)=>{if(o.id!==this.inlineEditingId&&(!o.resolved||this.plugin.settings.showResolved))this.renderer.draw(ctx,o,images[i]);});this.paintUI(s);
   }
   private repaint(){if(this.repaintFrame!==undefined)return;this.repaintFrame=requestAnimationFrame(()=>{this.repaintFrame=undefined;const s=this.surfaces.find(s=>s.page.id===this.page.id);if(s)void this.paint(s);});}
   private queuePreview(work:()=>void){this.previewWork=work;if(this.previewFrame!==undefined)return;this.previewFrame=requestAnimationFrame(()=>{this.previewFrame=undefined;const latest=this.previewWork;this.previewWork=undefined;latest?.();});}
   private repaintEraserRegion(s:Surface,x:number,y:number,w:number,h:number){
-    const epoch=s.epoch,scale=s.ink.width/s.page.width;
+    const epoch=s.epoch;
     if(epoch!==this.renderEpoch||!s.sheet.isConnected)return;
-    const ctx=s.ink.getContext('2d')!;ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(x*scale,y*scale,w*scale,h*scale);
+    const ctx=s.ink.getContext('2d')!;
+    if(this.infinite){
+      const view=this.stageSize(),dpr=s.ink.width/view.w,z=this.camera.zoom;
+      const [sx0,sy0]=worldToScreen(x,y,this.camera,view),[sx1,sy1]=worldToScreen(x+w,y+h,this.camera,view);
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.clearRect(sx0*dpr-2,sy0*dpr-2,(sx1-sx0)*dpr+4,(sy1-sy0)*dpr+4);
+      ctx.save();ctx.setTransform(dpr,0,0,dpr,0,0);ctx.translate(view.w/2,view.h/2);ctx.scale(z,z);ctx.translate(-this.camera.x,-this.camera.y);
+      ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
+      const region:Rect={x,y,w,h};
+      for(const o of filterVisibleItems(s.page.items,region,this.plugin.settings.showResolved,this.inlineEditingId)){
+        this.renderer.draw(ctx,o,o.resource?s.images?.get(o.resource)??this.renderer.cachedImage(o.resource):undefined);
+      }
+      ctx.restore();
+      return;
+    }
+    const scale=s.ink.width/s.page.width;
+    ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(x*scale,y*scale,w*scale,h*scale);
     ctx.save();ctx.setTransform(scale,0,0,scale,0,0);ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
     s.page.items.forEach(o=>{const a=o.rotation*Math.PI/180,rw=(Math.abs(o.w*Math.cos(a))+Math.abs(o.h*Math.sin(a)))/2,rh=(Math.abs(o.w*Math.sin(a))+Math.abs(o.h*Math.cos(a)))/2,cx=o.x+o.w/2,cy=o.y+o.h/2,pad=(o.width??2)*8;if(cx+rw+pad<x||cx-rw-pad>x+w||cy+rh+pad<y||cy-rh-pad>y+h)return;if(o.id!==this.inlineEditingId&&(!o.resolved||this.plugin.settings.showResolved))this.renderer.draw(ctx,o,o.resource?s.images?.get(o.resource)??this.renderer.cachedImage(o.resource):undefined);});ctx.restore();
   }
@@ -340,7 +644,9 @@ export class PenbookView extends TextFileView {
   }
   private paintUI(s:Surface,preview?:Item,polygon?:Point[],cursor?:Point){
     if(this.uiTheme?.root!==this.root){const theme=getComputedStyle(this.root);this.uiTheme={root:this.root,accent:theme.getPropertyValue('--interactive-accent').trim(),background:theme.getPropertyValue('--background-primary').trim(),muted:theme.getPropertyValue('--text-muted').trim()};}const {accent,background,muted}=this.uiTheme;
-    if(!s.visible||s.ink.width<=1)return;const overlay=s.page===this.page&&this.selection.size>0,ratio=(s.ink.width/s.page.width)/this.zoom;
+    if(!s.visible||s.ink.width<=1)return;
+    const view=this.infinite?this.stageSize():undefined;
+    const overlay=!this.infinite&&s.page===this.page&&this.selection.size>0,ratio=this.infinite?(s.ink.width/view!.w):((s.ink.width/s.page.width)/this.zoom);
     let offsetX=0,offsetY=0;
     if(overlay){
       if(s.ui.parentElement!==this.stage)this.stage.appendChild(s.ui);
@@ -353,18 +659,34 @@ export class PenbookView extends TextFileView {
       if(s.ui.width!==s.ink.width)s.ui.width=s.ink.width;if(s.ui.height!==s.ink.height)s.ui.height=s.ink.height;
     }
     const ctx=s.ui.getContext('2d')!;
-    if(!this.reading&&(this.gesture?.tool==='eraser'||!this.gesture&&['pen','eraser'].includes(this.tool))&&!overlay&&!preview&&!polygon&&!this.laserTrail){
+    const setWorldTransform=()=>{
+      if(this.infinite&&view){
+        ctx.setTransform(ratio,0,0,ratio,0,0);ctx.translate(view.w/2,view.h/2);ctx.scale(this.camera.zoom,this.camera.zoom);ctx.translate(-this.camera.x,-this.camera.y);
+      }else{
+        ctx.setTransform(ratio,0,0,ratio,0,0);ctx.translate(offsetX,offsetY);ctx.scale(this.zoom,this.zoom);
+      }
+    };
+    if(!this.reading&&(this.gesture?.tool==='eraser'||!this.gesture&&['pen','eraser'].includes(this.tool))&&!(s.page===this.page&&this.selection.size>0)&&!preview&&!polygon&&!this.laserTrail){
       cursor??=this.hover?.surface===s?this.hover.point:undefined;
-      const old=this.eraserCursorRects.get(s),pixelScale=ratio*this.zoom,visualRadius=(this.gesture?.tool??this.tool)==='eraser'?this.eraserSize:Math.max(this.width/2,2/this.zoom),pad=(visualRadius+4/this.zoom)*pixelScale;
-      const current=cursor?{x:cursor[0]*pixelScale-pad,y:cursor[1]*pixelScale-pad,w:pad*2,h:pad*2}:undefined;
+      const old=this.eraserCursorRects.get(s),visualRadius=(this.gesture?.tool??this.tool)==='eraser'?this.eraserSize:Math.max(this.width/2,2/this.zoom);
+      let current:{x:number;y:number;w:number;h:number}|undefined;
+      if(cursor){
+        if(this.infinite&&view){
+          const [sx,sy]=worldToScreen(cursor[0],cursor[1],this.camera,view),pad=(visualRadius*this.camera.zoom+4)*ratio;
+          current={x:sx*ratio-pad,y:sy*ratio-pad,w:pad*2,h:pad*2};
+        }else{
+          const pixelScale=ratio*this.zoom,pad=(visualRadius+4/this.zoom)*pixelScale;
+          current={x:cursor[0]*pixelScale-pad,y:cursor[1]*pixelScale-pad,w:pad*2,h:pad*2};
+        }
+      }
       ctx.setTransform(1,0,0,1,0,0);
       if(!old)ctx.clearRect(0,0,s.ui.width,s.ui.height);
       else{if(old)ctx.clearRect(old.x,old.y,old.w,old.h);if(current)ctx.clearRect(current.x,current.y,current.w,current.h);}
       this.eraserCursorRects.set(s,current??{x:0,y:0,w:0,h:0});
-      if(current&&cursor){ctx.setTransform(ratio,0,0,ratio,0,0);ctx.scale(this.zoom,this.zoom);ctx.strokeStyle=muted;ctx.lineWidth=1/this.zoom;ctx.beginPath();ctx.arc(cursor[0],cursor[1],visualRadius,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=background;ctx.lineWidth=.5/this.zoom;ctx.stroke();}
+      if(current&&cursor){setWorldTransform();ctx.strokeStyle=muted;ctx.lineWidth=1/this.zoom;ctx.beginPath();ctx.arc(cursor[0],cursor[1],visualRadius,0,Math.PI*2);ctx.stroke();ctx.strokeStyle=background;ctx.lineWidth=.5/this.zoom;ctx.stroke();}
       return;
     }
-    this.eraserCursorRects.delete(s);ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,s.ui.width,s.ui.height);ctx.scale(ratio,ratio);ctx.translate(offsetX,offsetY);ctx.scale(this.zoom,this.zoom);
+    this.eraserCursorRects.delete(s);ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,s.ui.width,s.ui.height);setWorldTransform();
     if(preview)this.renderer.draw(ctx,preview);
     if(s.page.id===this.page.id&&this.selection.size){const f=this.selectionFrame();if(f){ctx.save();ctx.translate(f.cx,f.cy);ctx.rotate(f.angle);ctx.strokeStyle=accent;ctx.lineWidth=1.5/this.zoom;ctx.setLineDash([5/this.zoom,4/this.zoom]);ctx.strokeRect(-f.w/2,-f.h/2,f.w,f.h);ctx.setLineDash([]);ctx.fillStyle=background;ctx.fillRect(f.w/2-5/this.zoom,f.h/2-5/this.zoom,10/this.zoom,10/this.zoom);ctx.strokeRect(f.w/2-5/this.zoom,f.h/2-5/this.zoom,10/this.zoom,10/this.zoom);const y=-f.h/2-28/this.zoom;ctx.beginPath();ctx.moveTo(0,-f.h/2);ctx.lineTo(0,y+11/this.zoom);ctx.stroke();ctx.beginPath();ctx.arc(0,y,11/this.zoom,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.translate(-8/this.zoom,y-8/this.zoom);ctx.scale(16/256/this.zoom,16/256/this.zoom);ctx.fillStyle=accent;ctx.fill(new Path2D(ICONS.rotate));ctx.restore();}}
     if(polygon?.length){ctx.beginPath();ctx.moveTo(polygon[0][0],polygon[0][1]);for(const p of polygon)ctx.lineTo(p[0],p[1]);ctx.strokeStyle=accent;ctx.lineWidth=1.5/this.zoom;ctx.setLineDash([5,4]);ctx.stroke();ctx.setLineDash([]);}
@@ -389,30 +711,60 @@ export class PenbookView extends TextFileView {
     const tick=()=>{const trail=this.laserTrail;if(!trail||!trail.surface.ui.isConnected||this.closed){this.laserTrail=undefined;this.laserFrame=undefined;return;}if(trail.releasedAt!==undefined&&performance.now()-trail.releasedAt>=1000){this.laserTrail=undefined;this.laserFrame=undefined;this.paintUI(trail.surface);return;}this.paintUI(trail.surface);this.laserFrame=trail.releasedAt!==undefined?requestAnimationFrame(tick):undefined;};
     this.laserFrame=requestAnimationFrame(tick);
   }
-  private point(e:{clientX:number;clientY:number;pressure?:number},s:Surface):Point{const r=s.sheet.getBoundingClientRect();return[(e.clientX-r.left)*s.page.width/r.width,(e.clientY-r.top)*s.page.height/r.height,Math.pow(Math.max(.05,e.pressure||.5),this.plugin.settings.pressure)];}
+  private point(e:{clientX:number;clientY:number;pressure?:number},s:Surface):Point{
+    const r=s.sheet.getBoundingClientRect(),p=Math.pow(Math.max(.05,e.pressure||.5),this.plugin.settings.pressure);
+    if(this.infinite){
+      const [wx,wy]=screenToWorld(e.clientX-r.left,e.clientY-r.top,this.camera,{w:r.width||this.stageSize().w,h:r.height||this.stageSize().h});
+      return[wx,wy,p];
+    }
+    return[(e.clientX-r.left)*s.page.width/r.width,(e.clientY-r.top)*s.page.height/r.height,p];
+  }
   private activate(s:Surface){if(s.page.id===this.page.id)return;const previous=this.surfaces.find(v=>v.page===this.page),hadSelection=this.selection.size>0;this.index=this.book.pages.indexOf(s.page);this.selection.clear();if(hadSelection&&previous?.visible)this.paintUI(previous);this.drawSidebar();this.drawFooter();this.updateSelectionBar();this.surfaces.forEach(v=>v.sheet.toggleClass('is-active',v===s));}
   private pointerDown(e:PointerEvent,s:Surface){
     if(!this.valid||e.pointerType==='pen'&&!this.plugin.settings.penEnabled)return;
     rememberAnchor(null);
     this.lastPointerType=e.pointerType;
-    if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;}
+    if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;this.infinitePinch=undefined;}
     if(e.pointerType==='touch'&&(Date.now()-this.lastPen<700||this.gesture?.pointer!==undefined&&this.gesture.tool!=='hand'))return;
     const textPlacement=!this.reading&&(this.tool==='sticky'||this.tool==='text');
     e.preventDefault();s.ui.setPointerCapture(e.pointerId);this.activate(s);if(!textPlacement)this.root.focus({preventScroll:true});
-    if(e.pointerType==='touch'&&(!this.fingerInk||this.reading||this.tool==='hand')){this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});if(this.touches.size===2){const[a,b]=[...this.touches.values()];this.pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),zoom:this.zoom,cx:(a.x+b.x)/2,cy:(a.y+b.y)/2};}return;}
+    if(this.infinite&&(e.button===1||(e.buttons&4)!==0||this.spacePanning&&e.button===0)){
+      this.middlePan={pointerId:e.pointerId,lastX:e.clientX,lastY:e.clientY};s.sheet.addClass('is-panning');return;
+    }
+    if(e.pointerType==='touch'&&(!this.fingerInk||this.reading||this.tool==='hand')){
+      this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      if(this.touches.size===2){
+        const[a,b]=[...this.touches.values()];
+        const dist=Math.hypot(a.x-b.x,a.y-b.y);
+        if(this.infinite){
+          const r=this.stage.getBoundingClientRect();
+          this.infinitePinch={distance:dist,camera:{...this.camera},mid:[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top]};
+        }else{
+          this.pinch={distance:dist,zoom:this.zoom,cx:(a.x+b.x)/2,cy:(a.y+b.y)/2};
+        }
+      }
+      return;
+    }
     if(this.gesture){if(this.gesture.pointerType===e.pointerType)return;this.finishGesture(true);}const pt=this.point(e,s);let tool=this.reading?'hand':this.tool;if(e.pointerType==='pen'&&(e.button===5||(e.buttons&32)!==0||e.button===2))tool='eraser';
-    if(this.sampleColor){this.sampleColor=false;const canvas=document.createElement('canvas');canvas.width=canvas.height=1;const ctx=canvas.getContext('2d')!;for(const layer of[s.bg,s.ink])ctx.drawImage(layer,pt[0]*layer.width/s.page.width,pt[1]*layer.height/s.page.height,1,1,0,0,1,1);const c=ctx.getImageData(0,0,1,1).data;this.chooseColor('#'+[c[0],c[1],c[2]].map(n=>n.toString(16).padStart(2,'0')).join(''));this.drawContext();return;}
+    if(this.sampleColor){this.sampleColor=false;const canvas=document.createElement('canvas');canvas.width=canvas.height=1;const ctx=canvas.getContext('2d')!;
+      if(this.infinite){const r=s.sheet.getBoundingClientRect(),sx=(e.clientX-r.left)*s.bg.width/Math.max(1,r.width),sy=(e.clientY-r.top)*s.bg.height/Math.max(1,r.height);for(const layer of[s.bg,s.ink])ctx.drawImage(layer,sx,sy,1,1,0,0,1,1);}
+      else{for(const layer of[s.bg,s.ink])ctx.drawImage(layer,pt[0]*layer.width/s.page.width,pt[1]*layer.height/s.page.height,1,1,0,0,1,1);}
+      const c=ctx.getImageData(0,0,1,1).data;this.chooseColor('#'+[c[0],c[1],c[2]].map(n=>n.toString(16).padStart(2,'0')).join(''));this.drawContext();return;
+    }
     const frame=tool==='lasso'?this.selectionFrame():null,selectionHit=frame?this.selectionHit(pt,frame):undefined;
     const tape=[...s.page.items].reverse().find(o=>o.kind==='tape'&&contains(o,pt[0],pt[1]));if(tape&&['hand','lasso'].includes(tool)&&!selectionHit){const before=this.snapshot();tape.revealed=!tape.revealed;this.changed(before);this.repaint();return;}
     if(s.page.locked&&!['hand','laser'].includes(tool)){new Notice('页面已锁定，请在更多中解锁');return;}
     if(this.reading){const o=[...s.page.items].reverse().find(o=>o.kind==='link'&&contains(o,pt[0],pt[1]));if(o){void this.run(()=>this.openLink(o.target??''));return;}}
     if(['text','link','table'].includes(tool)){void this.run(()=>this.insertObject(tool as 'text'|'link'|'table',pt));return;}
-    const before=['hand','laser','sticky'].includes(tool)?undefined:this.snapshot();this.gesture={pointer:e.pointerId,pointerType:e.pointerType,surface:s,tool,points:[pt],start:pt,last:pt,lastMoved:performance.now(),before,eraseSession:tool==='eraser'?uid():undefined,erasedStrokes:tool==='eraser'?new Set():undefined,eraseOutlines:tool==='eraser'?new Map():undefined};
+    const before=['hand','laser','sticky'].includes(tool)?undefined:this.snapshot();
+    const g:Gesture={pointer:e.pointerId,pointerType:e.pointerType,surface:s,tool,points:[pt],start:pt,last:pt,lastMoved:performance.now(),before,eraseSession:tool==='eraser'?uid():undefined,erasedStrokes:tool==='eraser'?new Set():undefined,eraseOutlines:tool==='eraser'?new Map():undefined,panX:e.clientX,panY:e.clientY};
+    this.gesture=g;
+    if(tool==='hand'&&this.infinite)s.sheet.addClass('is-panning');
     if(tool==='lasso'){
-      if(frame&&selectionHit){this.gesture.mode=selectionHit;this.gesture.frame=frame;this.gesture.original=clone(this.page.items.filter(o=>this.selection.has(o.id)&&!o.locked));}
+      if(frame&&selectionHit){g.mode=selectionHit;g.frame=frame;g.original=clone(this.page.items.filter(o=>this.selection.has(o.id)&&!o.locked));}
       else this.paintUI(s);
     }
-    if(tool==='eraser'){this.queueErase(this.gesture,pt,pt);this.paintUI(s,undefined,undefined,pt);}
+    if(tool==='eraser'){this.queueErase(g,pt,pt);this.paintUI(s,undefined,undefined,pt);}
     if(tool==='laser')this.laserPoint(s,pt,true);
     if(e.pointerType==='pen'&&['pen','shape'].includes(tool))this.startPenHold(pt);
   }
@@ -461,14 +813,40 @@ export class PenbookView extends TextFileView {
   }
   private pointerMove(e:PointerEvent,s:Surface){
     if(e.pointerType==='pen')this.lastPen=Date.now();
+    if(this.middlePan?.pointerId===e.pointerId){
+      e.preventDefault();
+      const dx=e.clientX-this.middlePan.lastX,dy=e.clientY-this.middlePan.lastY;
+      this.middlePan.lastX=e.clientX;this.middlePan.lastY=e.clientY;
+      this.setInfiniteCamera({...this.camera,x:this.camera.x-dx/this.camera.zoom,y:this.camera.y-dy/this.camera.zoom});
+      return;
+    }
     if(e.pointerType!=='touch'){this.hover={surface:s,point:this.point(e,s)};const f=this.tool==='lasso'&&s.page===this.page?this.selectionFrame():null,hit=f?this.selectionHit(this.hover.point,f):undefined;s.ui.style.cursor=this.tool==='lasso'?(hit==='resize'?'nwse-resize':hit==='rotate'?'grab':hit==='move'?'move':'default'):'';if(!this.gesture)this.queuePreview(()=>{if(!this.gesture&&this.hover?.surface===s)this.paintUI(s,undefined,undefined,this.hover.point);});}
     if(this.touches.has(e.pointerId)){
       e.preventDefault();const old=this.touches.get(e.pointerId)!;this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      if(this.infinite){
+        if(this.touches.size===1){
+          const dx=e.clientX-old.x,dy=e.clientY-old.y;
+          this.setInfiniteCamera({...this.camera,x:this.camera.x-dx/this.camera.zoom,y:this.camera.y-dy/this.camera.zoom});
+        }else if(this.infinitePinch&&this.touches.size>=2){
+          const[a,b]=[...this.touches.values()],r=this.stage.getBoundingClientRect();
+          const currMid:[number,number]=[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top],currDist=Math.hypot(a.x-b.x,a.y-b.y);
+          this.setInfiniteCamera(pinchTransform(this.infinitePinch.camera,this.infinitePinch.mid,this.infinitePinch.distance,currMid,currDist,this.stageSize()));
+        }
+        return;
+      }
       if(this.touches.size===1){this.stage.scrollLeft-=e.clientX-old.x;this.stage.scrollTop-=e.clientY-old.y;}
       else if(this.pinch){const[a,b]=[...this.touches.values()];const next=Math.max(.15,Math.min(4,this.pinch.zoom*Math.hypot(a.x-b.x,a.y-b.y)/Math.max(1,this.pinch.distance)));const ratio=next/this.zoom;this.zoom=next;for(const surface of this.surfaces){surface.sheet.style.width=`${surface.page.width*next}px`;surface.sheet.style.height=`${surface.page.height*next}px`;}this.stage.scrollLeft=(this.stage.scrollLeft+this.stage.clientWidth/2)*ratio-this.stage.clientWidth/2;this.stage.scrollTop=(this.stage.scrollTop+this.stage.clientHeight/2)*ratio-this.stage.clientHeight/2;}
       return;
     }
-    const g=this.gesture;if(!g||g.ending||g.pointer!==e.pointerId)return;e.preventDefault();const pt=this.point(e,g.surface),last=g.last;
+    const g=this.gesture;if(!g||g.ending||g.pointer!==e.pointerId)return;e.preventDefault();
+    if(g.tool==='hand'){
+      if(this.infinite&&g.panX!==undefined&&g.panY!==undefined){
+        const dx=e.clientX-g.panX,dy=e.clientY-g.panY;g.panX=e.clientX;g.panY=e.clientY;
+        this.setInfiniteCamera({...this.camera,x:this.camera.x-dx/this.camera.zoom,y:this.camera.y-dy/this.camera.zoom});
+      }
+      return;
+    }
+    const pt=this.point(e,g.surface),last=g.last;
     if(this.penHoldStart){const d=Math.hypot(pt[0]-this.penHoldStart[0],pt[1]-this.penHoldStart[1]);if(d>8/this.zoom)this.cancelPenHold();}
     if(g.mode&&g.original&&g.frame){const dx=pt[0]-g.start[0],dy=pt[1]-g.start[1],f=g.frame,c=Math.cos(f.angle),s=Math.sin(f.angle),start=this.framePoint(g.start,f),p=this.framePoint(pt,f);
       const scaleX=Math.max(.05,Math.min(20,1+(p.x-start.x)/Math.max(1,f.w))),scaleY=Math.max(.05,Math.min(20,1+(p.y-start.y)/Math.max(1,f.h))),a=Math.atan2(pt[1]-f.cy,pt[0]-f.cx)-Math.atan2(g.start[1]-f.cy,g.start[0]-f.cx),anchorX=f.cx-f.w/2*c+f.h/2*s,anchorY=f.cy-f.w/2*s-f.h/2*c;
@@ -488,16 +866,18 @@ export class PenbookView extends TextFileView {
     g.last=pt;
   }
   private pointerUp(e:PointerEvent){
-    if(this.touches.has(e.pointerId)){this.touches.delete(e.pointerId);if(this.touches.size<2)this.pinch=undefined;if(!this.touches.size){this.drawPages();this.drawFooter();}return;}
+    if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;this.surfaces[0]?.sheet.removeClass('is-panning');this.persistViewport();return;}
+    if(this.touches.has(e.pointerId)){this.touches.delete(e.pointerId);if(this.touches.size<2){this.pinch=undefined;this.infinitePinch=undefined;}if(!this.touches.size){if(this.infinite){this.persistViewport();this.drawFooter();}else{this.drawPages();this.drawFooter();}}return;}
         this.cancelPenHold();if(this.penHoldFired){this.penHoldFired=false;const back=this.penEraserBefore;this.penEraserBefore=undefined;if(back&&back!=='eraser')window.setTimeout(()=>{if(this.tool==='eraser')this.setTool(back);},0);}
     if(this.gesture?.pointer===e.pointerId){const g=this.gesture;const end=this.point(e,g.surface);if(g.tool==='eraser'&&!g.ending)this.queueErase(g,g.last,end);g.last=end;if(g.tool==='pen'&&Math.hypot(end[0]-g.points.at(-1)![0],end[1]-g.points.at(-1)![1])>.2)g.points.push(end);this.finishGesture(true);}
   }
-  private pointerCancel(e:PointerEvent){this.cancelPenHold();this.touches.delete(e.pointerId);this.pinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
+  private pointerCancel(e:PointerEvent){this.cancelPenHold();if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;this.surfaces[0]?.sheet.removeClass('is-panning');}this.touches.delete(e.pointerId);this.pinch=undefined;this.infinitePinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
   private finishGesture(commit:boolean):void|Promise<void>{
     const current=this.gesture;
     if(current?.tool==='eraser'&&!current.finalized&&commit){return current.ending??(current.ending=this.finishEraser(current));}
     if(current?.tool==='eraser'&&!commit)this.backgroundEraser.stop();
     if(this.shapeTimer!==undefined)window.clearTimeout(this.shapeTimer);this.shapeTimer=undefined;const g=this.gesture;if(!g)return;this.gesture=undefined;
+    if(g.tool==='hand'&&this.infinite){g.surface.sheet.removeClass('is-panning');this.persistViewport();return;}
     if(g.tool==='laser'){if(this.laserTrail){if(commit){this.laserTrail.releasedAt=performance.now();this.animateLaser();}else this.laserTrail=undefined;}this.paintUI(g.surface);return;}
     if(!commit){if(!g.before){this.paintUI(g.surface);return;}Object.assign(this.book,clone(g.before));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();if(this.valid&&this.root)this.render();return;}
     let edited=false;
@@ -585,11 +965,13 @@ export class PenbookView extends TextFileView {
     this.button(this.selectionBar,objects.every(o=>o.locked)?'解锁':'锁定','锁定或解锁选区',()=>mutate(()=>{const locked=!objects.every(o=>o.locked);objects.forEach(o=>o.locked=locked);}));
     this.button(this.selectionBar,'组合','组合选区',()=>mutate(()=>{const group=uid();objects.forEach(o=>o.group=group);}));this.button(this.selectionBar,'解组','取消组合',()=>mutate(()=>objects.forEach(o=>delete o.group)));
     if(objects.length===1){this.button(this.selectionBar,'编辑','编辑内容与样式',()=>this.editItem(objects[0]));if(objects[0].kind==='image'&&!objects[0].pdfNative)this.button(this.selectionBar,'裁剪','裁剪图片',()=>this.cropImage(objects[0]));}
-    this.button(this.selectionBar,'移至页面','移动或复制选区到其他页',()=>this.transferObjects());
+    if(!this.infinite)this.button(this.selectionBar,'移至页面','移动或复制选区到其他页',()=>this.transferObjects());
     if(objects.every(o=>o.kind==='sticky'))this.button(this.selectionBar,'解决便签','标记或取消已解决',()=>mutate(()=>objects.forEach(o=>o.resolved=!o.resolved)));
   }
   private copySelection(objects=this.page.items.filter(o=>this.selection.has(o.id)),notify=true){if(!objects.length)return;this.clipboard=selectionClipboard(objects,this.book);if(notify)new Notice('选区已复制，可切换到其他 Penbook 笔记本粘贴。');}
-  private pasteSelection(){if(!this.clipboard)return;const before=this.snapshot(),copied=pasteItems(this.clipboard,this.book);this.page.items.push(...copied);this.selection=new Set(copied.map(o=>o.id));this.tool='lasso';this.changed(before);this.repaint();this.drawSidebar();this.drawToolbar();}
+  private pasteSelection(){if(!this.clipboard)return;const before=this.snapshot(),copied=pasteItems(this.clipboard,this.book);
+    if(this.infinite&&copied.length){const cb=contentBounds(copied,0),vr=visibleWorldRect(this.camera,this.stageSize());if(cb&&!rectsIntersect(cb,vr)){const dx=this.camera.x-(cb.x+cb.w/2),dy=this.camera.y-(cb.y+cb.h/2);for(const o of copied){o.x+=dx;o.y+=dy;}}}
+    this.page.items.push(...copied);this.selection=new Set(copied.map(o=>o.id));this.tool='lasso';this.changed(before);this.repaint();this.drawSidebar();this.drawToolbar();}
   private async transform(){const objects=this.page.items.filter(o=>this.selection.has(o.id)&&!o.locked);if(!objects.length)return;
     const v=await form(this.app,'变换选区',[{key:'rotate',name:'旋转角度（增量）',value:'0',type:'number'},{key:'scale',name:'缩放比例 %',value:'100',type:'number'},{key:'opacity',name:'透明度 %',value:String(Math.round(objects[0].opacity*100)),type:'number'}]);if(!v)return;
     const rotation=Number(v.rotate),scale=Number(v.scale)/100,opacity=Number(v.opacity)/100;if(!Number.isFinite(rotation)||!Number.isFinite(scale)||scale<.05||scale>20||!Number.isFinite(opacity)){new Notice('请输入有效的变换参数');return;}
@@ -600,13 +982,13 @@ export class PenbookView extends TextFileView {
   private async insertObject(kind:'text'|'sticky'|'link'|'table',p:Point){
     if(this.page.locked)return;rememberAnchor(this.penButtons.get(kind==='sticky'?'sticky':'text')??null);
     if(kind==='text'||kind==='sticky'){
-      const {pinned,...style}=this.textStyle,w=Math.min(kind==='sticky'?220:320,this.page.width-16),x=Math.max(0,Math.min(p[0],this.page.width-w)),y=Math.max(0,Math.min(p[1],this.page.height-140));
+      const {pinned,...style}=this.textStyle,w=this.infinite?(kind==='sticky'?220:320):Math.min(kind==='sticky'?220:320,this.page.width-16),x=this.infinite?p[0]:Math.max(0,Math.min(p[0],this.page.width-w)),y=this.infinite?p[1]:Math.max(0,Math.min(p[1],this.page.height-140));
       const object:Item={...item(kind,x,y,w,kind==='sticky'?140:100,kind==='sticky'?this.contrast(this.stickyColor):this.color),...style,text:'',backgroundColor:kind==='sticky'?this.stickyColor:undefined};
       const page=this.page;this.inlineText(object,text=>{if(!text.trim())return;const before=this.snapshot(),{pinned,...style}=this.textStyle;Object.assign(object,style,{text,color:kind==='sticky'?this.contrast(this.stickyColor):this.color});object.h=object.bh=Math.max(object.h,kind==='sticky'?140:60,text.split('\n').length*style.fontSize*style.lineHeight+20);page.items.push(object);this.selection=new Set([object.id]);this.changed(before);if(kind!=='text'||!pinned)this.setTool('lasso');this.repaint();this.drawSidebar();});return;
     }
     let o:Item;
-    if(kind==='table'){const v=await form(this.app,'插入表格',[{key:'rows',name:'行数',value:'4',type:'number'},{key:'columns',name:'列数',value:'3',type:'number'}]);if(!v)return;const rows=Math.max(1,Math.min(50,Number(v.rows)||4)),columns=Math.max(1,Math.min(30,Number(v.columns)||3));o={...item('table',p[0],p[1],Math.min(360,this.page.width-p[0]),200,this.color),rows,columns,width:1.5};}
-    else{const v=await form(this.app,'插入链接',[{key:'text',name:'内容',value:''},{key:'target',name:'笔记路径、页面链接或 URL',value:''}]);if(!v||!v.text.trim())return;const{pinned,...style}=this.textStyle;o={...item('link',p[0],p[1],Math.min(320,Math.max(100,this.page.width-p[0]-20)),60,this.color),...style,text:v.text,target:v.target};}
+    if(kind==='table'){const v=await form(this.app,'插入表格',[{key:'rows',name:'行数',value:'4',type:'number'},{key:'columns',name:'列数',value:'3',type:'number'}]);if(!v)return;const rows=Math.max(1,Math.min(50,Number(v.rows)||4)),columns=Math.max(1,Math.min(30,Number(v.columns)||3));o={...item('table',p[0],p[1],this.infinite?360:Math.min(360,this.page.width-p[0]),200,this.color),rows,columns,width:1.5};}
+    else{const v=await form(this.app,'插入链接',[{key:'text',name:'内容',value:''},{key:'target',name:'笔记路径、页面链接或 URL',value:''}]);if(!v||!v.text.trim())return;const{pinned,...style}=this.textStyle;o={...item('link',p[0],p[1],this.infinite?320:Math.min(320,Math.max(100,this.page.width-p[0]-20)),60,this.color),...style,text:v.text,target:v.target};}
     const before=this.snapshot();this.page.items.push(o);this.selection=new Set([o.id]);this.changed(before);this.setTool('lasso');this.repaint();this.drawSidebar();
   }
   private async editItem(o:Item,point?:Point){
@@ -627,12 +1009,15 @@ export class PenbookView extends TextFileView {
   private inlineText(object:Item,commit:(text:string)=>void){
     this.inlineEditor?.finish(true);const surface=this.surfaces.find(s=>s.page.id===this.page.id);if(!surface)return;
     const textarea=document.body.createDiv({cls:'pb-inline-text',attr:{contenteditable:'true',role:'textbox','aria-multiline':'true','aria-label':object.kind==='sticky'?'便签文字':'文本框文字','data-placeholder':'输入文字'}});textarea.tabIndex=0;textarea.textContent=object.text??'';
-    const position=()=>{const bounds=surface.sheet.getBoundingClientRect();textarea.style.left=`${bounds.left+object.x*this.zoom}px`;textarea.style.top=`${bounds.top+object.y*this.zoom}px`;textarea.style.width=`${object.w*this.zoom}px`;textarea.style.minHeight=`${object.h*this.zoom}px`;};position();textarea.style.transform=`rotate(${object.rotation}deg)`;
+    const position=()=>{const bounds=surface.sheet.getBoundingClientRect();
+      if(this.infinite){const [sx,sy]=worldToScreen(object.x,object.y,this.camera,{w:Math.max(1,bounds.width),h:Math.max(1,bounds.height)});textarea.style.left=`${bounds.left+sx}px`;textarea.style.top=`${bounds.top+sy}px`;}
+      else{textarea.style.left=`${bounds.left+object.x*this.zoom}px`;textarea.style.top=`${bounds.top+object.y*this.zoom}px`;}
+      textarea.style.width=`${object.w*this.zoom}px`;textarea.style.minHeight=`${object.h*this.zoom}px`;};position();textarea.style.transform=`rotate(${object.rotation}deg)`;
     textarea.style.background=object.kind==='sticky'?object.backgroundColor??this.stickyColor:'transparent';
     const refresh=()=>{textarea.style.fontFamily=this.textStyle.font;textarea.style.fontSize=`${this.textStyle.fontSize*this.zoom}px`;textarea.style.fontWeight=this.textStyle.bold?'bold':'normal';textarea.style.fontStyle=this.textStyle.italic?'italic':'normal';textarea.style.lineHeight=String(this.textStyle.lineHeight);textarea.style.textAlign=this.textStyle.align;textarea.style.color=object.kind==='sticky'?this.contrast(object.backgroundColor??this.stickyColor):this.color;};
     const events=new AbortController(),inputScope=new Scope();this.app.keymap.pushScope(inputScope);let finished=false,composing=false;
-    const finish=(save:boolean)=>{if(finished)return;finished=true;const text=textarea.innerText.replace(/\n$/,'');if(save)object.h=object.bh=Math.max(object.h,textarea.scrollHeight/this.zoom);events.abort();this.app.keymap.popScope(inputScope);textarea.remove();this.inlineEditor=undefined;this.inlineEditingId=undefined;if(save)commit(text);this.repaint();};
-    this.inlineEditor={finish,refresh};this.inlineEditingId=object.id;refresh();this.repaint();
+    const finish=(save:boolean)=>{if(finished)return;finished=true;const text=textarea.innerText.replace(/\n$/,'');if(save)object.h=object.bh=Math.max(object.h,textarea.scrollHeight/this.zoom);events.abort();this.app.keymap.popScope(inputScope);textarea.remove();this.inlineEditor=undefined;this.inlineEditingId=undefined;this.inlineReposition=undefined;if(save)commit(text);this.repaint();};
+    this.inlineEditor={finish,refresh};this.inlineEditingId=object.id;this.inlineReposition=position;refresh();this.repaint();
     textarea.oninput=()=>{textarea.setCssProps({height:'auto'});textarea.setCssProps({height:`${Math.max(object.h*this.zoom,textarea.scrollHeight)}px`});};
     document.addEventListener('scroll',position,{capture:true,signal:events.signal});window.addEventListener('resize',position,{signal:events.signal});
     textarea.addEventListener('paste',e=>{e.preventDefault();e.stopPropagation();document.execCommand('insertText',false,e.clipboardData?.getData('text/plain')??'');},{signal:events.signal});
@@ -660,6 +1045,7 @@ export class PenbookView extends TextFileView {
   }
   canShortcut(action:ShortcutAction,target:Element|null=document.activeElement){
     if(!this.valid||this.closed||this.inlineEditor||target?.closest('input,textarea,select,[contenteditable]:not([contenteditable=false]),.modal,.pb-popover'))return false;
+    if(this.infinite&&['previous-page','next-page','first-page','last-page','new-page'].includes(action))return false;
     if(this.page.locked&&EDIT_ACTIONS.has(action))return false;
     if(SELECTION_ACTIONS.has(action)&&!this.selection.size)return false;
     if(action==='paste'&&!this.clipboard)return false;
@@ -667,7 +1053,11 @@ export class PenbookView extends TextFileView {
   }
   private key(e:KeyboardEvent){
     if(e.defaultPrevented||e.isComposing||e.keyCode===229)return false;
-    const action=shortcutAction(e),target=e.target instanceof Element?e.target:null;
+    const target=e.target instanceof Element?e.target:null;
+    if(this.infinite&&(e.code==='Space'||e.key===' ')&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&!this.inlineEditor&&!target?.closest('input,textarea,select,[contenteditable]:not([contenteditable=false]),.modal,.pb-popover')){
+      e.preventDefault();e.stopPropagation();if(!this.spacePanning){this.spacePanning=true;this.stage?.addClass('pb-space-pan');}return true;
+    }
+    const action=shortcutAction(e);
     if(!action||!this.canShortcut(action,target))return false;
     e.preventDefault();e.stopPropagation();
     if(!e.repeat||['left','right','up','down','zoom-in','zoom-out','thinner','thicker','next-page','previous-page'].includes(action))void this.run(()=>this.executeShortcut(action,e.shiftKey));
@@ -707,9 +1097,26 @@ export class PenbookView extends TextFileView {
       case 'new-page':this.addPage();break;case 'export-pdf':await this.exportDialog();break;case 'page-link':await this.copyLink();break;
     }
   }
-  private async pasteEvent(e:ClipboardEvent){if(this.page.locked||(e.target as HTMLElement).closest('input,textarea,[contenteditable=true]'))return;const image=Array.from(e.clipboardData?.items??[]).find(i=>i.type.startsWith('image/'))?.getAsFile();if(image){e.preventDefault();await this.run(()=>this.importFile(image));return;}const text=e.clipboardData?.getData('text/plain');if(text&&!this.clipboard){e.preventDefault();const before=this.snapshot();this.page.items.push({...item('text',60,60,400,240,this.color),text,fontSize:22});this.changed(before);this.repaint();}}
-  private addPage(){const before=this.snapshot();const p=newPage(this.page.paper);p.width=this.page.width;p.height=this.page.height;p.color=this.page.color;p.spacing=this.page.spacing;this.book.pages.splice(this.index+1,0,p);this.index++;this.selection.clear();this.changed(before);this.render();}
+  private async pasteEvent(e:ClipboardEvent){if(this.page.locked||(e.target as HTMLElement).closest('input,textarea,[contenteditable=true]'))return;const image=Array.from(e.clipboardData?.items??[]).find(i=>i.type.startsWith('image/'))?.getAsFile();if(image){e.preventDefault();await this.run(()=>this.importFile(image));return;}const text=e.clipboardData?.getData('text/plain');if(text&&!this.clipboard){e.preventDefault();const before=this.snapshot(),x=this.infinite?this.camera.x-200:60,y=this.infinite?this.camera.y-120:60;this.page.items.push({...item('text',x,y,400,240,this.color),text,fontSize:22});this.changed(before);this.repaint();this.drawSidebar();}}
+  private addPage(){if(this.infinite)return;const before=this.snapshot();const p=newPage(this.page.paper);p.width=this.page.width;p.height=this.page.height;p.color=this.page.color;p.spacing=this.page.spacing;this.book.pages.splice(this.index+1,0,p);this.index++;this.selection.clear();this.changed(before);this.render();}
+  private applyInfiniteBackground(draft:{paper:Paper;color:string;spacing:number;showGuides:boolean}){
+    const styleChanged=this.page.paper!==draft.paper||this.page.color!==draft.color||this.page.spacing!==draft.spacing;
+    if(styleChanged){const before=this.snapshot();this.page.paper=draft.paper;this.page.color=draft.color;this.page.spacing=draft.spacing;this.showGuides=draft.showGuides;this.syncViewportToBook();this.changed(before);}
+    else{this.showGuides=draft.showGuides;this.syncViewportToBook();this.persistViewport();}
+    this.drawToolbar();this.renderInfiniteFrame(true);
+  }
   private pageMenu(e?:MouseEvent){const menu=new Menu();const add=(title:string,fn:()=>void|Promise<void>)=>menu.addItem(i=>i.setTitle(title).setIcon(`pb-${actionIcon(title)}`).onClick(()=>void this.run(fn)));
+    if(this.infinite){
+      add('添加视角书签',()=>this.addViewportBookmark());
+      add('画布背景与参考线',()=>infiniteTemplatePicker(toolAnchor()??this.toolbarRight,this.page,this.showGuides,d=>this.applyInfiniteBackground(d)));
+      add(this.showGuides?'隐藏 A4 参考虚线':'显示 A4 参考虚线',()=>this.toggleGuides());
+      add('适应全部内容',()=>this.fit());
+      add('回到原点',()=>this.resetOrigin());
+      if(this.clipboard)add('粘贴选区',()=>this.pasteSelection());
+      add('导入 PDF 或图片…',()=>this.importMenu());
+      add('清空画布内容…',()=>this.clearPage());
+      if(e)menu.showAtMouseEvent(e);else this.showMenu(menu);return;
+    }
     add('页面设置、标题与标签',()=>this.pageProperties());add(this.page.bookmark?'取消书签':'添加书签',()=>{const before=this.snapshot();this.page.bookmark=!this.page.bookmark;this.changed(before);this.drawSidebar();});
     add('复制页面',()=>this.copyPage());
     add('插入空白页面',()=>this.addPage());add('移动至页码…',()=>this.movePage());add('复制到其他笔记本…',()=>this.transferPage(false));add('移动到其他笔记本…',()=>this.transferPage(true));
@@ -718,8 +1125,21 @@ export class PenbookView extends TextFileView {
     if(this.page.background&&this.book.resources[this.page.background.resource]?.type==='pdf')add('裁切 PDF 页面…',()=>this.cropPdfPage());
     add('清空页面内容…',()=>this.clearPage());add('删除页面…',()=>this.deletePage());if(e)menu.showAtMouseEvent(e);else this.showMenu(menu);
   }
-  private moreMenu(){const anchor=toolAnchor()??this.toolbarRight;popover(anchor,(panel,close)=>{panel.addClass('pb-more-panel');panelHeader(panel,'更多',close);const g=section(panel),pageRow=g.createDiv('pb-page-summary');pageRow.createEl('strong',{text:`页面 ${this.index+1}`});const thumb=pageRow.createEl('canvas');thumb.width=36;thumb.height=48;const ctx=thumb.getContext('2d')!;ctx.scale(36/this.page.width,48/this.page.height);this.renderer.paper(ctx,this.page);
-    const act=(fn:()=>void|Promise<void>)=>()=>{close();void this.run(fn);};
+  private moreMenu(){const anchor=toolAnchor()??this.toolbarRight;popover(anchor,(panel,close)=>{panel.addClass('pb-more-panel');panelHeader(panel,'更多',close);const act=(fn:()=>void|Promise<void>)=>()=>{close();void this.run(fn);};
+    if(this.infinite){
+      const g=section(panel),pageRow=g.createDiv('pb-page-summary');pageRow.createEl('strong',{text:'无界画布'});const thumb=pageRow.createEl('canvas');thumb.width=36;thumb.height=48;drawInfiniteBackground(thumb.getContext('2d')!,this.page,{x:0,y:0,zoom:0.5},{w:36,h:48},this.showGuides,1,false);
+      row(g,'添加视角书签',act(()=>this.addViewportBookmark()),'','bookmark');
+      row(g,'画布背景与参考线',()=>infiniteTemplatePicker(anchor,this.page,this.showGuides,d=>this.applyInfiniteBackground(d)),'','palette');
+      row(g,'适应全部内容',act(()=>this.fit()),'','fit');
+      row(g,'回到原点',act(()=>this.resetOrigin()),'','origin');
+      row(g,'显示或隐藏小地图',act(()=>this.toggleMinimap()),this.minimapVisible?'已开启':'已关闭','minimap');
+      const remove=section(panel,'清空画布');row(remove,'删除特定项目',act(()=>this.removeItems(anchor)),'','delete');row(remove,'清空画布内容',act(()=>this.clearPage()),'',undefined,true);
+      const settings=section(panel,'设置');row(settings,this.page.locked?'解锁画布':'锁定画布',()=>{const before=this.snapshot();this.page.locked=!this.page.locked;this.changed(before);this.drawSidebar();close();},'',this.page.locked?'unlock':'lock');toggle(settings,'显示已解决的便签',this.plugin.settings.showResolved,v=>{this.plugin.settings.showResolved=v;void this.plugin.saveSettings();this.repaint();});toggle(settings,'显示 A4 分页参考虚线',this.showGuides,v=>{this.showGuides=v;this.syncViewportToBook();this.persistViewport();this.drawToolbar();this.renderInfiniteFrame(true);});
+      new Setting(settings).setName('边栏').addDropdown(d=>d.addOptions({left:'左边',right:'右边'}).setValue(this.plugin.settings.leftHanded?'right':'left').onChange(v=>{this.plugin.settings.leftHanded=v==='right';this.root.toggleClass('pb-left',v==='right');void this.plugin.saveSettings();}));row(settings,'触控笔和防误触',()=>this.inputPanel(anchor),'','pen');
+      const extra=section(panel,'笔记本');row(extra,'笔记本属性',act(()=>this.bookProperties()),'','notebook');row(extra,'导入 PDF 或图片到画布',act(()=>this.importMenu()),'','import');row(extra,'将文本笔记插入画布',act(()=>this.insertMarkdown()),'','text');row(extra,'保存 Markdown 索引',act(()=>this.exportIndex()),'','file');
+      return;
+    }
+    const g=section(panel),pageRow=g.createDiv('pb-page-summary');pageRow.createEl('strong',{text:`页面 ${this.index+1}`});const thumb=pageRow.createEl('canvas');thumb.width=36;thumb.height=48;const ctx=thumb.getContext('2d')!;ctx.scale(36/this.page.width,48/this.page.height);this.renderer.paper(ctx,this.page);
     row(g,this.page.bookmark?'取消收藏':'添加到收藏夹',()=>{const before=this.snapshot();this.page.bookmark=!this.page.bookmark;this.changed(before);this.drawSidebar();close();},'','bookmark');
     row(g,'拷贝页面',act(()=>this.copyPage()),'','copy');row(g,'旋转页面',act(()=>this.rotatePage()),'','rotate');row(g,'将页面添加到大纲',act(async()=>{const v=await form(this.app,'大纲标题',[{key:'title',name:'标题',value:this.page.outline??this.page.title}]);if(v){const before=this.snapshot();this.page.outline=v.title;this.changed(before);this.drawSidebar();}}),'','file');
     row(g,'更改模板',()=>templatePicker(anchor,this.page,draft=>{const before=this.snapshot();this.page.paper=draft.paper;this.page.color=draft.color;this.page.width=draft.width;this.page.height=draft.height;this.changed(before);this.render();}),'','palette');row(g,'前往页面',act(()=>this.contents()),`1–${this.book.pages.length}`,'next');
@@ -746,9 +1166,9 @@ export class PenbookView extends TextFileView {
   }
   private async contents(){const options:Record<string,string>={};this.book.pages.forEach((p,i)=>{options[p.id]=`${p.bookmark?'书签 · ':''}${i+1}. ${p.title||'未命名页面'}`;p.pdfBookmarks?.forEach((b,j)=>options[`${p.id}#${j}`]=`${'　'.repeat(Math.min(b.level,8))}${b.title} · 第 ${i+1} 页`);});const v=await form(this.app,'目录与书签',[{key:'page',name:'跳转页面',value:this.page.id,options}]);if(v)this.goToId(v.page.split('#')[0]);}
   private async movePage(){const v=await form(this.app,'移动页面',[{key:'position',name:`目标页码（1–${this.book.pages.length}）`,value:String(this.index+1),type:'number'}]);if(!v)return;const to=Math.max(0,Math.min(this.book.pages.length-1,Number(v.position)-1));if(!Number.isInteger(to))return;const before=this.snapshot();const[p]=this.book.pages.splice(this.index,1);this.book.pages.splice(to,0,p);this.index=to;this.changed(before);this.render();}
-  private async clearPage(){if(this.page.locked||!await confirmAction(this.app,'清空当前页（可撤销）','移除此页的所有未锁定笔迹和对象？','清空'))return;const before=this.snapshot();this.page.items=this.page.items.filter(o=>o.locked);this.selection.clear();this.changed(before);this.repaint();this.drawSidebar();}
+  private async clearPage(){if(this.page.locked||!await confirmAction(this.app,this.infinite?'清空画布（可撤销）':'清空当前页（可撤销）',this.infinite?'移除画布上的所有未锁定笔迹和对象？':'移除此页的所有未锁定笔迹和对象？','清空'))return;const before=this.snapshot();this.page.items=this.page.items.filter(o=>o.locked);this.selection.clear();this.changed(before);this.repaint();this.drawSidebar();}
   private async deletePage(){if(!await confirmAction(this.app,'删除当前页（可撤销）','确认删除此页及其笔迹？','删除'))return;const before=this.snapshot();this.book.pages.splice(this.index,1);if(!this.book.pages.length)this.book.pages.push(newPage(this.plugin.settings.paper));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();this.changed(before);this.render();}
-  async copyLink(){if(!this.file)return;const link=`obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file.path)}&page=${this.page.id}`;await navigator.clipboard.writeText(`[${this.book.title} · ${this.page.title||'第 '+(this.index+1)+' 页'}](${link})`);new Notice('页面链接已复制');}
+  async copyLink(){if(!this.file)return;if(this.infinite){const link=`obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file.path)}`;await navigator.clipboard.writeText(`[${this.book.title}](${link})`);new Notice('笔记本链接已复制');return;}const link=`obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file.path)}&page=${this.page.id}`;await navigator.clipboard.writeText(`[${this.book.title} · ${this.page.title||'第 '+(this.index+1)+' 页'}](${link})`);new Notice('页面链接已复制');}
   private async transferObjects(){const selected=this.page.items.filter(o=>this.selection.has(o.id));if(!selected.length)return;const options:Record<string,string>={};this.book.pages.forEach((p,i)=>{if(i!==this.index)options[p.id]=`${i+1}. ${p.title||'未命名页面'}`;});if(!Object.keys(options).length){new Notice('请先添加另一页');return;}const v=await form(this.app,'选区转移',[{key:'page',name:'目标页面',value:Object.keys(options)[0],options},{key:'mode',name:'操作',value:'copy',options:{copy:'复制',move:'移动'}}]);if(!v)return;const before=this.snapshot(),target=this.book.pages.find(p=>p.id===v.page)!;const copies=clone(selected);copies.forEach(o=>o.id=uid());target.items.push(...copies);if(v.mode==='move')this.page.items=this.page.items.filter(o=>!this.selection.has(o.id)||o.locked);this.selection.clear();this.changed(before);this.repaint();this.drawSidebar();}
   private pageUrl(path:string,id:string){return `obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(path)}&page=${id}`;}
   private async transferPage(move:boolean){const book=this.book,page=this.page,sourcePath=this.file?.path??'',destination=await pickFile(this.app,f=>f.extension==='penbook'&&f.path!==sourcePath,'选择目标笔记本');if(!destination||this.book!==book||!book.pages.includes(page))return;let copiedId='';
@@ -756,6 +1176,13 @@ export class PenbookView extends TextFileView {
     if(move&&this.book===book){const before=this.snapshot();book.pages.splice(book.pages.indexOf(page),1);for(const p of book.pages)for(const link of p.pdfLinks??[])if(link.page===page.id){link.url=this.pageUrl(destination.path,copiedId);delete link.page;}if(!book.pages.length)book.pages.push(newPage());this.index=Math.min(this.index,book.pages.length-1);this.changed(before);this.render();}new Notice(move?'页面已移动':'页面已复制');
   }
   private importMenu(){const menu=new Menu();const add=(title:string,fn:()=>void|Promise<void>)=>menu.addItem(i=>i.setTitle(title).setIcon(`pb-${actionIcon(title)}`).onClick(()=>void this.run(fn)));
+    if(this.infinite){
+      add('库中的 PDF 或图片',async()=>{const f=await pickFile(this.app,f=>['pdf','png','jpg','jpeg','webp','gif'].includes(f.extension),'选择 PDF 或图片');if(f)await this.importVaultFile(f);});
+      add('设备上的 PDF 或图片',async()=>{const f=await localFile('.pdf,image/png,image/jpeg,image/webp,image/gif');if(f)await this.importFile(f);});
+      add('将文本笔记插入画布',()=>this.insertMarkdown());
+      add('导入 PDF 为独立分页笔记本',()=>this.plugin.fromPdf());
+      this.showMenu(menu);return;
+    }
     add('导入 PDF 为 Penbook',()=>this.plugin.fromPdf());
     add('库中的 PDF 或图片',async()=>{const f=await pickFile(this.app,f=>['pdf','png','jpg','jpeg','webp','gif'].includes(f.extension),'选择 PDF 或图片');if(f)await this.importVaultFile(f);});
     add('设备上的 PDF 或图片',async()=>{const f=await localFile('.pdf,image/png,image/jpeg,image/webp,image/gif');if(f)await this.importFile(f);});
@@ -769,28 +1196,158 @@ export class PenbookView extends TextFileView {
     await this.importResource({type:isPdf?'pdf':'image',name,mime:isPdf?'application/pdf':mime,data:encode(bytes),size:bytes.length},replaceEmpty);
   }
   private async importResource(resource:Resource,replaceEmpty=false){
-    const key=uid(),book=this.book,before=this.snapshot(),isPdf=resource.type==='pdf';book.resources[key]=resource;
+    const key=uid(),book=this.book,before=this.snapshot(),isPdf=resource.type==='pdf',addedKeys:string[]=[];book.resources[key]=resource;
     try{
+      if(this.infinite){
+        if(!isPdf){
+          const img=await this.renderer.image(key,this.book),w=Math.min(img.width,640),h=w*img.height/Math.max(1,img.width);
+          const placed={...item('image',this.camera.x-w/2,this.camera.y-h/2,w,h,this.color),resource:key};
+          this.page.items.push(placed);this.selection=new Set([placed.id]);this.changed(before);this.repaint();this.drawSidebar();return;
+        }
+        const result=await this.pdfs.withDocument(key,book,async pdf=>{
+          let pageNums:number[],layout:'column'|'row'|'grid'='column';
+          if(pdf.numPages===1){pageNums=[1];}
+          else{
+            const v=await form(this.app,'导入 PDF 卡片到画布',[{key:'pages',name:`页码范围（共 ${pdf.numPages} 页，如 1-5 或 1,3,5）`,value:`1-${Math.min(pdf.numPages,20)}`},{key:'layout',name:'排列方式',value:'column',options:{column:'纵向排列',row:'横向排列',grid:'网格排列'}}]);
+            if(!v)return null;
+            const indices=new Set<number>();
+            for(const part of v.pages.split(/[,，]/)){
+              const m=part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+              if(!m)throw new Error('页码格式不正确');
+              const start=Number(m[1]),end=Number(m[2]??m[1]);
+              if(start<1||end>pdf.numPages||end<start)throw new Error('页码超出范围');
+              for(let i=start;i<=end;i++)indices.add(i);
+            }
+            pageNums=[...indices].sort((a,b)=>a-b);
+            if(!pageNums.length)throw new Error('未选择页面');
+            layout=v.layout==='row'||v.layout==='grid'?v.layout:'column';
+          }
+          new Notice(`正在将 ${pageNums.length} 页 PDF 渲染为画布卡片…`);
+          const cards:{imgKey:string;w:number;h:number}[]=[],baseName=resource.name.replace(/\.pdf$/i,'');
+          for(const pageNum of pageNums){
+            const pdfPage=await pdf.getPage(pageNum);
+            try{
+              const vp1=pdfPage.getViewport({scale:1}),cardW=Math.min(vp1.width,640),cardH=cardW*vp1.height/Math.max(1,vp1.width);
+              const renderScale=Math.min(2,Math.max(1,(cardW*2)/Math.max(1,vp1.width)),Math.sqrt(4_000_000/Math.max(1,vp1.width*vp1.height)));
+              const vp=pdfPage.getViewport({scale:renderScale}),c=document.createElement('canvas');
+              c.width=Math.max(1,Math.round(vp.width));c.height=Math.max(1,Math.round(vp.height));
+              try{
+                const ctx=c.getContext('2d')!;ctx.fillStyle='#ffffff';ctx.fillRect(0,0,c.width,c.height);
+                await pdfPage.render({canvasContext:ctx,canvas:c,viewport:vp}).promise;
+                const pngData=c.toDataURL('image/png').split(',')[1];
+                if(this.closed||this.book!==book)throw new Error('笔记本已切换，导入已取消');
+                const imgKey=uid();addedKeys.push(imgKey);
+                book.resources[imgKey]={type:'image',name:`${baseName}-p${pageNum}.png`,mime:'image/png',data:pngData};
+                cards.push({imgKey,w:cardW,h:cardH});
+              }finally{c.width=c.height=1;}
+            }finally{pdfPage.cleanup();}
+          }
+          return{cards,layout};
+        });
+        delete book.resources[key];
+        if(!result||!result.cards.length)return;
+        const {cards,layout}=result,gap=32,created:Item[]=[];
+        if(layout==='column'){
+          let cy=this.camera.y-cards[0].h/2;
+          for(const card of cards){created.push({...item('image',this.camera.x-card.w/2,cy,card.w,card.h,this.color),resource:card.imgKey});cy+=card.h+gap;}
+        }else if(layout==='row'){
+          let cx=this.camera.x-cards[0].w/2;
+          for(const card of cards){created.push({...item('image',cx,this.camera.y-card.h/2,card.w,card.h,this.color),resource:card.imgKey});cx+=card.w+gap;}
+        }else{
+          const cols=Math.min(4,Math.ceil(Math.sqrt(cards.length)));
+          const cellW=Math.max(...cards.map(c=>c.w))+gap,cellH=Math.max(...cards.map(c=>c.h))+gap;
+          const startX=this.camera.x-cards[0].w/2,startY=this.camera.y-cards[0].h/2;
+          cards.forEach((card,idx)=>created.push({...item('image',startX+(idx%cols)*cellW,startY+Math.floor(idx/cols)*cellH,card.w,card.h,this.color),resource:card.imgKey}));
+        }
+        this.page.items.push(...created);this.selection=new Set(created.map(o=>o.id));
+        this.changed(before);this.repaint();this.drawSidebar();new Notice(`已导入 ${created.length} 张 PDF 页面卡片`);return;
+      }
       if(isPdf){new Notice('正在导入 PDF…');const pages=await this.pdfs.withDocument(key,book,pdf=>importPdfPages(pdf,key,resource.name,book));if(this.closed||this.book!==book)throw new Error('笔记本已切换，导入已取消');if(replaceEmpty&&book.pages.length===1&&!this.page.items.length&&!this.page.background){book.pages=pages;this.index=0;}else{book.pages.splice(this.index+1,0,...pages);this.index++;}
       }else{const img=await this.renderer.image(key,this.book);const w=Math.min(img.width,this.page.width*.75),h=w*img.height/img.width;this.page.items.push({...item('image',40,40,w,h,this.color),resource:key});}
       this.changed(before);this.render();
-    }catch(error){delete book.resources[key];throw error;}
+    }catch(error){delete book.resources[key];for(const k of addedKeys)delete book.resources[k];throw error;}
   }
   private async importImageBackground(){const f=await localFile('image/png,image/jpeg,image/webp');if(!f)return;const bytes=new Uint8Array(await f.arrayBuffer()),key=uid(),before=this.snapshot();this.book.resources[key]={type:'image',name:f.name,mime:f.type,data:encode(bytes)};await this.renderer.image(key,this.book);this.page.background={resource:key};this.changed(before);this.drawPages();this.drawSidebar();}
   private async mergeNotebook(){const target=this.book,file=await pickFile(this.app,f=>f.extension==='penbook'&&f.path!==this.file?.path,'选择要合并的笔记本');if(!file)return;const book=parseBook(await this.app.vault.read(file));if(this.book!==target)return;const before=this.snapshot(),pages=copyPages(book.pages,book,target,id=>this.pageUrl(file.path,id));target.pages.splice(this.index+1,0,...pages);this.index++;this.changed(before);this.render();}
   private async saveTemplate(){const v=await form(this.app,'保存纸张模板',[{key:'name',name:'模板名称',value:this.page.title||'自定义模板'}]);if(!v)return;const book=newBook(v.name);book.pages=[clone(this.page)];book.resources=clone(this.book.resources);const folder=await this.plugin.folder(`${this.plugin.settings.folder}/模板`),name=v.name.replace(/[\\/:*?"<>|]/g,'-'),path=await this.plugin.unique(`${folder}/${name}.penbook`);await this.app.vault.create(path,JSON.stringify(book));new Notice(`模板已保存：${path}`);}
   private async loadTemplate(){const target=this.book,file=await pickFile(this.app,f=>f.extension==='penbook','选择模板笔记本（将插入第一页）');if(!file)return;const book=parseBook(await this.app.vault.read(file));if(this.book!==target)return;const before=this.snapshot(),[p]=copyPages([book.pages[0]],book,target,id=>this.pageUrl(file.path,id));target.pages.splice(this.index+1,0,p);this.index++;this.changed(before);this.render();}
-  private async insertMarkdown(){const f=await pickFile(this.app,f=>f.extension==='md','选择文本笔记');if(!f)return;const text=await this.app.vault.read(f),before=this.snapshot();this.page.items.push({...item('text',50,50,this.page.width-100,Math.min(this.page.height-100,500),this.color),text,fontSize:18});this.changed(before);this.repaint();this.drawSidebar();}
+  private async insertMarkdown(){const f=await pickFile(this.app,f=>f.extension==='md','选择文本笔记');if(!f)return;const text=await this.app.vault.read(f),before=this.snapshot(),w=this.infinite?560:this.page.width-100,h=this.infinite?420:Math.min(this.page.height-100,500),x=this.infinite?this.camera.x-w/2:50,y=this.infinite?this.camera.y-h/2:50;this.page.items.push({...item('text',x,y,w,h,this.color),text,fontSize:18});this.changed(before);this.repaint();this.drawSidebar();}
   private exportMenu(){const menu=new Menu();const add=(title:string,fn:()=>void|Promise<void>)=>menu.addItem(i=>i.setTitle(title).setIcon(`pb-${actionIcon(title)}`).onClick(()=>void this.run(fn)));
+    if(this.infinite){
+      add('导出 PDF…',()=>this.exportDialog());add('导出 PNG…',()=>this.exportPng());add('导出 SVG（笔迹为矢量）',()=>this.exportSvg());add('Markdown 内容与书签索引',()=>this.exportIndex());add('笔记本原始文件副本',async()=>{await this.flush();await this.plugin.writeBinary(`${this.book.title}.penbook`,new TextEncoder().encode(this.getViewData()));});add('导出预览图供 Markdown 嵌入',()=>this.preview());this.showMenu(menu);return;
+    }
     add('导出 PDF…',()=>this.exportDialog());add('当前页 PNG',()=>this.exportPng());add('当前页 SVG（笔迹为矢量）',()=>this.exportSvg());add('Markdown 页面索引',()=>this.exportIndex());add('笔记本原始文件副本',async()=>{await this.flush();await this.plugin.writeBinary(`${this.book.title}.penbook`,new TextEncoder().encode(this.getViewData()));});add('导出当前页预览供 Markdown 嵌入',()=>this.preview());this.showMenu(menu);
   }
-  async exportDialog(){const v=await form(this.app,'导出 PDF',[{key:'range',name:'页面范围',value:'all',options:{all:'整本笔记本',current:'当前页',custom:'指定页码'}},{key:'pages',name:'指定页码（例如 1,3-5）',value:''},{key:'mode',name:'内容',value:'all',options:{all:'背景与批注',ink:'仅笔迹与对象',background:'仅背景'}}]);if(!v)return;let pages=this.book.pages;if(v.range==='current')pages=[this.page];if(v.range==='custom'){const indices=new Set<number>();for(const part of v.pages.split(/[,，]/)){const m=part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);if(!m)throw new Error('页码格式不正确');const start=Number(m[1]),end=Number(m[2]??m[1]);if(start<1||end>this.book.pages.length||end<start)throw new Error('页码超出范围');for(let i=start;i<=end;i++)indices.add(i-1);}pages=[...indices].sort((a,b)=>a-b).map(i=>this.book.pages[i]);}if(!pages.length)throw new Error('未选择页面');await this.exportPdf(v.mode as 'all'|'ink'|'background',pages);}
+  async exportDialog(){
+    if(this.infinite){
+      const v=await form(this.app,'导出无界画布为 PDF',[{key:'scope',name:'导出范围',value:'a4-tiles',options:{'a4-tiles':'按 A4 网格分页（仅含内容区域）','fit-single':'全部内容合并为单页',viewport:'仅当前视口区域'}},{key:'mode',name:'内容',value:'all',options:{all:'背景与批注',ink:'仅笔迹与对象',background:'仅背景'}}]);
+      if(!v)return;
+      const mode=v.mode as 'all'|'ink'|'background',exportPages:Page[]=[],origins=new Map<Page,{x:number;y:number}>();
+      if(v.scope==='a4-tiles'){
+        const tiles=computeA4Tiles(this.page.items);
+        const list=tiles.length?tiles:[{col:Math.floor(this.camera.x/A4_WIDTH),row:Math.floor(this.camera.y/A4_HEIGHT),x:Math.floor(this.camera.x/A4_WIDTH)*A4_WIDTH,y:Math.floor(this.camera.y/A4_HEIGHT)*A4_HEIGHT,w:A4_WIDTH,h:A4_HEIGHT}];
+        for(const t of list){const vp=buildVirtualExportPage(this.page,t,`A4 (${t.col}, ${t.row})`);exportPages.push(vp);origins.set(vp,{x:t.x,y:t.y});}
+      }else if(v.scope==='fit-single'){
+        const region=contentBounds(this.page.items,48)??visibleWorldRect(this.camera,this.stageSize(),0);
+        const vp=buildVirtualExportPage(this.page,region,this.book.title);exportPages.push(vp);origins.set(vp,{x:region.x,y:region.y});
+      }else{
+        const region=visibleWorldRect(this.camera,this.stageSize(),0);
+        const vp=buildVirtualExportPage(this.page,region,'当前视口');exportPages.push(vp);origins.set(vp,{x:region.x,y:region.y});
+      }
+      new Notice('正在生成 PDF…');await this.flush();
+      const book={...this.book,pages:exportPages,resources:{...this.book.resources}};
+      const suffix=v.scope==='viewport'?'-视口':v.scope==='fit-single'?'-整图':'-无界分页';
+      const name=`${this.safeName()}${suffix}${mode==='all'?'':'-'+mode}.pdf`;
+      const bytes=await this.pdfs.export(book,exportPages,this.renderer,mode,origins);
+      await this.plugin.writeBinary(name,bytes);return;
+    }
+    const v=await form(this.app,'导出 PDF',[{key:'range',name:'页面范围',value:'all',options:{all:'整本笔记本',current:'当前页',custom:'指定页码'}},{key:'pages',name:'指定页码（例如 1,3-5）',value:''},{key:'mode',name:'内容',value:'all',options:{all:'背景与批注',ink:'仅笔迹与对象',background:'仅背景'}}]);if(!v)return;let pages=this.book.pages;if(v.range==='current')pages=[this.page];if(v.range==='custom'){const indices=new Set<number>();for(const part of v.pages.split(/[,，]/)){const m=part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);if(!m)throw new Error('页码格式不正确');const start=Number(m[1]),end=Number(m[2]??m[1]);if(start<1||end>this.book.pages.length||end<start)throw new Error('页码超出范围');for(let i=start;i<=end;i++)indices.add(i-1);}pages=[...indices].sort((a,b)=>a-b).map(i=>this.book.pages[i]);}if(!pages.length)throw new Error('未选择页面');await this.exportPdf(v.mode as 'all'|'ink'|'background',pages);
+  }
   private async exportPdf(mode:'all'|'ink'|'background',pages:Page[]){new Notice('正在生成 PDF…');await this.flush();const exportPages=clone(pages),book={...this.book,pages:exportPages,resources:{...this.book.resources}},name=`${this.safeName()}${pages.length===1?`-第${this.book.pages.indexOf(pages[0])+1}页`:''}${mode==='all'?'':'-'+mode}.pdf`,bytes=await this.pdfs.export(book,exportPages,this.renderer,mode);return this.plugin.writeBinary(name,bytes);}
   private safeName(){return this.book.title.replace(/[\\/:*?"<>|]/g,'-');}
-  private async exportPng(){const c=await this.pdfs.canvas(this.page,this.book,this.renderer,this.plugin.settings.exportScale);await this.plugin.writeBinary(`${this.safeName()}-第${this.index+1}页.png`,decode(c.toDataURL('image/png').split(',')[1]));}
-  private async exportIndex(){const title=this.book.title.replace(/[\r\n]/g,' ');const text=[`# ${title}`,'',`笔记本：[[${this.file?.path}]]`,'',...this.book.pages.flatMap((p,i)=>[`## ${i+1}. ${p.title||'未命名页面'}`,'',`[打开此页](obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file?.path??'')}&page=${p.id})`,p.tags.length?'标签：'+p.tags.map(t=>'#'+t.replace(/\s/g,'-')).join(' '):'',...p.items.filter(o=>o.text).map(o=>o.text!),p.pdfText,''])].join('\n');const folder=await this.plugin.folder(this.plugin.settings.folder),path=await this.plugin.unique(`${folder}/${this.safeName()}-索引.md`),file=await this.app.vault.create(path,text);await this.app.workspace.getLeaf('tab').openFile(file);new Notice('页面索引已保存');}
-  private async preview(){if(!this.file)return;const c=await this.pdfs.canvas(this.page,this.book,this.renderer,.6),path=normalizePath(`${this.file.parent?.path??''}/${this.file.basename}.preview.png`),data=decode(c.toDataURL().split(',')[1]);const f=this.app.vault.getAbstractFileByPath(path);if(f instanceof TFile)await this.app.vault.modifyBinary(f,new Uint8Array(data).buffer);else await this.app.vault.createBinary(path,new Uint8Array(data).buffer);new Notice('预览已保存。可使用 penbook 代码块嵌入笔记本。');}
+  private async exportPng(){
+    if(this.infinite){
+      const v=await form(this.app,'导出 PNG',[{key:'scope',name:'导出范围',value:'content',options:{content:'全部内容边界',viewport:'当前视口'}}]);
+      if(!v)return;
+      const region=v.scope==='viewport'?visibleWorldRect(this.camera,this.stageSize(),0):(contentBounds(this.page.items,48)??visibleWorldRect(this.camera,this.stageSize(),0));
+      const c=await renderInfiniteExportCanvas(this.page,this.book,this.renderer,region,this.plugin.settings.exportScale,'all');
+      try{await this.plugin.writeBinary(`${this.safeName()}${v.scope==='viewport'?'-视口':'-无界画布'}.png`,decode(c.toDataURL('image/png').split(',')[1]));}finally{c.width=c.height=1;}
+      return;
+    }
+    const c=await this.pdfs.canvas(this.page,this.book,this.renderer,this.plugin.settings.exportScale);await this.plugin.writeBinary(`${this.safeName()}-第${this.index+1}页.png`,decode(c.toDataURL('image/png').split(',')[1]));
+  }
+  private async exportIndex(){
+    const title=this.book.title.replace(/[\r\n]/g,' ');
+    let text:string;
+    if(this.infinite){
+      const vault=encodeURIComponent(this.app.vault.getName()),file=encodeURIComponent(this.file?.path??'');
+      const bmLines=(this.book.bookmarks??[]).map(bm=>`- [${bm.title}](obsidian://penbook?vault=${vault}&file=${file}&bookmark=${encodeURIComponent(bm.id)}) (${Math.round(bm.x)}, ${Math.round(bm.y)} · ${Math.round(bm.zoom*100)}%)`);
+      const contentLines=this.page.items.filter(o=>['text','sticky','link','table'].includes(o.kind)).map(o=>o.kind==='table'?(o.cells??[]).map(r=>r.join(' | ')).join('\n'):o.kind==='link'?`[${o.text??''}](${o.target??''})`:(o.text??'')).filter(Boolean);
+      text=[`# ${title}`,'',`笔记本：[[${this.file?.path}]]`,'',...(bmLines.length?['## 视角书签','', ...bmLines,'']:[]),'## 画布内容','', ...contentLines,this.page.pdfText,''].join('\n');
+    }else{
+      text=[`# ${title}`,'',`笔记本：[[${this.file?.path}]]`,'',...this.book.pages.flatMap((p,i)=>[`## ${i+1}. ${p.title||'未命名页面'}`,'',`[打开此页](obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(this.file?.path??'')}&page=${p.id})`,p.tags.length?'标签：'+p.tags.map(t=>'#'+t.replace(/\s/g,'-')).join(' '):'',...p.items.filter(o=>o.text).map(o=>o.text!),p.pdfText,''])].join('\n');
+    }
+    const folder=await this.plugin.folder(this.plugin.settings.folder),path=await this.plugin.unique(`${folder}/${this.safeName()}-索引.md`),file=await this.app.vault.create(path,text);await this.app.workspace.getLeaf('tab').openFile(file);new Notice('页面索引已保存');
+  }
+  private async preview(){if(!this.file)return;
+    const c=this.infinite
+      ?await renderInfiniteExportCanvas(this.page,this.book,this.renderer,contentBounds(this.page.items,48)??visibleWorldRect(this.camera,this.stageSize(),0),.6,'all')
+      :await this.pdfs.canvas(this.page,this.book,this.renderer,.6);
+    try{
+      const path=normalizePath(`${this.file.parent?.path??''}/${this.file.basename}.preview.png`),data=decode(c.toDataURL().split(',')[1]);
+      const f=this.app.vault.getAbstractFileByPath(path);if(f instanceof TFile)await this.app.vault.modifyBinary(f,new Uint8Array(data).buffer);else await this.app.vault.createBinary(path,new Uint8Array(data).buffer);
+      new Notice('预览已保存。可使用 penbook 代码块嵌入笔记本。');
+    }finally{c.width=c.height=1;}
+  }
   private async exportSvg(){
+    if(this.infinite){
+      const region=contentBounds(this.page.items,48)??visibleWorldRect(this.camera,this.stageSize(),0);
+      const vp=buildVirtualExportPage(this.page,region),bg=await renderInfiniteExportCanvas(this.page,this.book,this.renderer,region,1,'background'),ctx=document.createElement('canvas').getContext('2d')!;
+      const nodes=[`<image width="${vp.width}" height="${vp.height}" href="${bg.toDataURL()}"/>`];
+      vp.items.forEach((o,i)=>nodes.push(itemSvg(o,this.book,this.renderer,ctx,`item-${i}`)));bg.width=bg.height=1;
+      const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${vp.width}" height="${vp.height}" viewBox="0 0 ${vp.width} ${vp.height}">${nodes.join('')}</svg>`;
+      await this.plugin.writeBinary(`${this.safeName()}-无界画布.svg`,new TextEncoder().encode(svg));return;
+    }
     const p=this.page;const bg=await this.pdfs.canvas(p,this.book,this.renderer,1,'background'),ctx=document.createElement('canvas').getContext('2d')!;
     const nodes=[`<image width="${p.width}" height="${p.height}" href="${bg.toDataURL()}"/>`];
     p.items.forEach((o,i)=>nodes.push(itemSvg(o,this.book,this.renderer,ctx,`item-${i}`)));bg.width=bg.height=1;

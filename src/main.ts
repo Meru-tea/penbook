@@ -1,6 +1,6 @@
 import { Plugin, PluginSettingTab, Setting, Notice, TFile, normalizePath, Menu, Modal } from 'obsidian';
-import { newBook, newPage, Notebook, Paper, Pen, InkProfile, clone, parseBook } from './model';
-import { notebookWizard, PAPER_NAMES, coverPreview } from './templates';
+import { newBook, newPage, Notebook, Paper, Pen, InkProfile, clone, parseBook, isInfiniteBook, normalizeInfinitePaper } from './model';
+import { notebookWizard, PAPER_NAMES, coverPreview, paperPreview } from './templates';
 import { PRESET_COLORS } from './palette';
 import { form, pickFile } from './dialogs';
 import { PenbookView, VIEW_TYPE } from './view';
@@ -29,6 +29,7 @@ export default class PenbookPlugin extends Plugin {
     this.registerView(VIEW_TYPE,leaf=>new PenbookView(leaf,this));this.registerExtensions(['penbook'],VIEW_TYPE);
     this.addRibbonIcon('pb-pen','新建手写笔记本',()=>void this.createNotebook());
     this.addCommand({id:'new-notebook',name:'新建手写笔记本',callback:()=>void this.createNotebook()});
+    this.addCommand({id:'new-infinite-notebook',name:'新建无界笔记',callback:()=>void this.createInfiniteNotebook()});
     this.addCommand({id:'library',name:'笔记本列表',callback:()=>new Library(this).open()});
     this.addCommand({id:'import-pdf',name:'从 PDF 创建手写笔记本',callback:()=>void this.fromPdf()});
     for(const [id,label] of SHORTCUTS){
@@ -43,14 +44,24 @@ export default class PenbookPlugin extends Plugin {
       if(params.vault&&params.vault!==this.app.vault.getName())return;
       const file=this.app.vault.getAbstractFileByPath(normalizePath(params.file??''));if(!(file instanceof TFile)||file.extension!=='penbook')return;
       const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);
-      if(leaf.view instanceof PenbookView)leaf.view.goToId(params.page??'');
+      if(leaf.view instanceof PenbookView){
+        if(params.bookmark)leaf.view.goToBookmarkId(params.bookmark);
+        else if(params.page)leaf.view.goToId(params.page);
+      }
     });
     this.registerMarkdownCodeBlockProcessor('penbook',async(source,el,ctx)=>{
-      const [path,pageId]=source.trim().split('#');const file=this.app.metadataCache.getFirstLinkpathDest(path,ctx.sourcePath);
+      const [path,targetId]=source.trim().split('#');const file=this.app.metadataCache.getFirstLinkpathDest(path,ctx.sourcePath);
       if(!file||file.extension!=='penbook'){el.setText('找不到 Penbook 笔记本');return;}
-      try{const book=parseBook(await this.app.vault.read(file)),page=book.pages.find(p=>p.id===pageId)??book.pages[0];
-        const button=el.createEl('button',{text:`${book.title} · ${page.title||'第 '+(book.pages.indexOf(page)+1)+' 页'}`});icon(button,'notebook');
-        button.onclick=async()=>{const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);if(leaf.view instanceof PenbookView)leaf.view.goToId(page.id);};
+      try{const book=parseBook(await this.app.vault.read(file));
+        if(isInfiniteBook(book)){
+          const bm=targetId?book.bookmarks?.find(b=>b.id===targetId):undefined;
+          const button=el.createEl('button',{text:`${book.title} · ${bm?bm.title:'无界笔记'}`});icon(button,'infinite');
+          button.onclick=async()=>{const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);if(leaf.view instanceof PenbookView&&bm)leaf.view.goToBookmarkId(bm.id);};
+        }else{
+          const page=book.pages.find(p=>p.id===targetId)??book.pages[0];
+          const button=el.createEl('button',{text:`${book.title} · ${page.title||'第 '+(book.pages.indexOf(page)+1)+' 页'}`});icon(button,'notebook');
+          button.onclick=async()=>{const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);if(leaf.view instanceof PenbookView)leaf.view.goToId(page.id);};
+        }
         const cached=this.app.vault.getAbstractFileByPath(`${file.parent?.path??''}/${file.basename}.preview.png`);if(cached instanceof TFile)el.createEl('img',{attr:{src:this.app.vault.getResourcePath(cached),alt:book.title}});
       }catch{el.setText('无法读取 Penbook 文件');}
     });
@@ -70,6 +81,11 @@ export default class PenbookPlugin extends Plugin {
     const path=await this.unique(`${folder?folder+'/':''}${safe}.penbook`);const file=await this.app.vault.create(path,JSON.stringify(book??newBook(title,this.settings.paper)));
     const leaf=this.app.workspace.getLeaf(false);await leaf.openFile(file);return leaf.view instanceof PenbookView?leaf.view:undefined;
   }
+  async createInfiniteNotebook(){
+    const draft=await notebookWizard(this.app,normalizeInfinitePaper(this.settings.paper),'infinite');
+    if(!draft)return;
+    return this.createNotebook(draft.title,draft);
+  }
   async duplicate(file:TFile){const b=parseBook(await this.app.vault.read(file));b.title+=' 副本';b.created=new Date().toISOString();await this.createNotebook(b.title,b);}
   async fromPdf(file?:TFile){const pdf=file??await pickFile(this.app,f=>f.extension==='pdf','选择库中的 PDF');if(!pdf)return;const view=await this.createNotebook(pdf.basename);if(view)await view.importVaultFile(pdf,true);}
 }
@@ -78,11 +94,22 @@ export const PAPERS=PAPER_NAMES;
 class Library extends Modal {
   constructor(private plugin:PenbookPlugin){super(plugin.app);}
   async onOpen(){
-    this.titleEl.setText('Penbook · 笔记本');const search=this.contentEl.createEl('input',{attr:{placeholder:'搜索名称、标签、页面内容…',type:'search'}});search.addClass('pb-library-search');
+    this.titleEl.setText('Penbook · 笔记本');const search=this.contentEl.createEl('input',{attr:{placeholder:'搜索名称、标签、书签、页面内容…',type:'search'}});search.addClass('pb-library-search');
     const list=this.contentEl.createDiv('pb-library');const entries: {file:TFile;book:Notebook}[]=[];
     for(const file of this.app.vault.getFiles().filter(f=>f.extension==='penbook').sort((a,b)=>b.stat.mtime-a.stat.mtime)){try{entries.push({file,book:parseBook(await this.app.vault.read(file))});}catch{/* Invalid files remain available in the vault. */}}
-    const draw=()=>{list.empty();const query=search.value.toLowerCase();for(const {file,book} of entries){if(query&&!`${book.title} ${book.tags.join(' ')} ${book.pages.map(p=>p.title+' '+p.tags.join(' ')+' '+p.pdfText+' '+p.ocr+' '+p.items.map(o=>o.text??'').join(' ')).join(' ')}`.toLowerCase().includes(query))continue;
-      const card=list.createEl('button',{cls:'pb-library-card'});const cover=card.createDiv({cls:'pb-book-cover'});if(book.hasCover!==false)coverPreview(cover,book);else cover.style.background=book.pages[0].color;card.createEl('strong',{text:book.title});card.createEl('small',{text:`${book.pages.length} 页 · ${file.path}`});card.onclick=async()=>{this.close();await this.app.workspace.getLeaf(false).openFile(file);};}
+    const draw=()=>{list.empty();const query=search.value.toLowerCase();for(const {file,book} of entries){if(query&&!`${book.title} ${book.tags.join(' ')} ${(book.bookmarks??[]).map(b=>b.title).join(' ')} ${book.pages.map(p=>p.title+' '+p.tags.join(' ')+' '+p.pdfText+' '+p.ocr+' '+p.items.map(o=>o.text??'').join(' ')).join(' ')}`.toLowerCase().includes(query))continue;
+      const isInf=isInfiniteBook(book);
+      const card=list.createEl('button',{cls:'pb-library-card'});const cover=card.createDiv({cls:'pb-book-cover'});
+      if(isInf){
+        cover.addClass('pb-book-cover-infinite');
+        if(book.hasCover!==false)coverPreview(cover,book);else paperPreview(cover,book.pages[0],true);
+        cover.createSpan({cls:'pb-infinite-badge',text:'∞ 无界'});
+      }else{
+        if(book.hasCover!==false)coverPreview(cover,book);else cover.style.background=book.pages[0].color;
+      }
+      card.createEl('strong',{text:book.title});
+      card.createEl('small',{text:isInf?`无界笔记${book.bookmarks?.length?` · ${book.bookmarks.length} 个书签`:''} · ${file.path}`:`${book.pages.length} 页 · ${file.path}`});
+      card.onclick=async()=>{this.close();await this.app.workspace.getLeaf(false).openFile(file);};}
       if(!list.children.length)list.createEl('p',{text:'没有匹配的笔记本。使用左侧钢笔按钮新建。'});
     };search.oninput=draw;draw();
   }

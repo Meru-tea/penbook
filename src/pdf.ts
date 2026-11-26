@@ -7,6 +7,7 @@ import { BudgetCache, RenderQueue } from './resources';
 import { addObjectAnnotation, applyPdfCrop, writePdfNavigation } from './pdf-annotations';
 import { ANNOTATION_ATTACHMENT, AnnotationArchive } from './pdf-import';
 import { NativeAnnotations } from './pdf-native-export';
+import { renderInfiniteExportCanvas } from './infinite';
 async function pngBytes(canvas:HTMLCanvasElement){try{const blob=await new Promise<Blob>((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('无法编码页面图片')),'image/png'));return new Uint8Array(await blob.arrayBuffer());}finally{canvas.width=canvas.height=1;}}
 
 export class PDFs {
@@ -100,7 +101,7 @@ export class PDFs {
     return canvas;
     }catch(error){canvas.width=canvas.height=1;throw error;}
   }
-  async export(book:Notebook,pages:Page[],renderer:Renderer,mode:'all'|'ink'|'background') {
+  async export(book:Notebook,pages:Page[],renderer:Renderer,mode:'all'|'ink'|'background',infiniteOrigins?:Map<Page,{x:number;y:number}>) {
     const out=await PDFDocument.create(),archive:AnnotationArchive={format:'penbook-annotations',version:1,resources:{},pages:[]},records:{page:Page;target:import('pdf-lib').PDFPage}[]=[];
     const native=new Map<Page,PDFPage>(),nativeAnnotations=new NativeAnnotations(out,{...book,pages}),keys=new Set([...pages.filter(p=>mode!=='ink'&&p.background&&book.resources[p.background.resource]?.type==='pdf').map(p=>p.background!.resource),...pages.flatMap(p=>mode==='background'?[]:p.items.flatMap(o=>o.pdfNative?[o.pdfNative.resource]:[]))]);
     for(const key of keys){
@@ -122,7 +123,14 @@ export class PDFs {
         target=native.get(page)!;out.addPage(target);
       } else {
         target=out.addPage([page.width,page.height]);
-        if(mode!=='ink'){const image=await out.embedPng(await pngBytes(await this.canvas(page,book,renderer,1.5,'background')));target.drawImage(image,{x:0,y:0,width:page.width,height:page.height});}
+        if(mode!=='ink'){
+          const origin=infiniteOrigins?.get(page);
+          const bgCanvas=origin
+            ?await renderInfiniteExportCanvas(page,book,renderer,{x:origin.x,y:origin.y,w:page.width,h:page.height},1.5,'background')
+            :await this.canvas(page,book,renderer,1.5,'background');
+          const image=await out.embedPng(await pngBytes(bgCanvas));
+          target.drawImage(image,{x:0,y:0,width:page.width,height:page.height});
+        }
       }
       records.push({page,target});const saved:AnnotationArchive['pages'][number]={width:page.width,height:page.height,annotations:[]};archive.pages.push(saved);
       if(mode!=='background')for(const o of page.items){if(o.pdfNative){await nativeAnnotations.add(target,page,o,renderer);continue;}saved.annotations.push(await addObjectAnnotation(out,target,page,o,book,renderer));if(o.resource&&book.resources[o.resource]?.type==='image')archive.resources[o.resource]=book.resources[o.resource];}

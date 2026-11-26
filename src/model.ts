@@ -32,10 +32,20 @@ export interface Page {
   pdfAnnotationIds?:string[];
 }
 export interface Resource { type: 'pdf' | 'image'; name: string; mime: string; data: string; size?:number }
+export type BookMode = 'paged' | 'infinite';
+export type InfinitePaper = 'blank' | 'dots' | 'grid' | 'ruled';
+export interface Viewport { x: number; y: number; zoom: number; showGuides?: boolean; }
+export interface ViewportBookmark { id: string; title: string; x: number; y: number; zoom: number; }
+export const INFINITE_PAPERS: readonly InfinitePaper[] = ['dots', 'grid', 'ruled', 'blank'];
+export const isInfiniteBook = (book?: Pick<Notebook, 'mode'>): boolean => book?.mode === 'infinite';
+export function normalizeInfinitePaper(paper: Paper): InfinitePaper {
+  return (INFINITE_PAPERS as readonly string[]).includes(paper) ? (paper as InfinitePaper) : 'dots';
+}
 export interface Notebook {
   format: 'penbook'; version: 1; title: string; cover: string; tags: string[];
   created: string; modified: string; pages: Page[]; resources: Record<string, Resource>;
   coverStyle?:string; spineColor?:string; hasCover?:boolean; language?:string;
+  mode?: BookMode; viewport?: Viewport; bookmarks?: ViewportBookmark[];
 }
 export const uid = () => crypto.randomUUID();
 export const clone = <T>(value: T): T => structuredClone(value);
@@ -43,14 +53,42 @@ export const nativeTextStyle=(o:Item)=>JSON.stringify([o.text,o.color,o.font,o.f
 export function newPage(paper: Paper = 'ruled'): Page {
   return { id: uid(), title: '', width: 794, height: 1123, paper, color: '#ffffff', spacing: 28, items: [], bookmark: false, tags: [], ocr: '', pdfText: '' };
 }
-export function newBook(title = '未命名笔记本', paper: Paper = 'ruled'): Notebook {
+export function newBook(title = '未命名笔记本', paper: Paper = 'ruled', mode: BookMode = 'paged'): Notebook {
   const now = new Date().toISOString();
+  if (mode === 'infinite') {
+    return {
+      format: 'penbook', version: 1, title, cover: '#7f6df2', tags: [], created: now, modified: now,
+      pages: [newPage(normalizeInfinitePaper(paper))], resources: {},
+      mode: 'infinite', viewport: { x: 0, y: 0, zoom: 1, showGuides: false }, bookmarks: [],
+    };
+  }
   return { format: 'penbook', version: 1, title, cover: '#7f6df2', tags: [], created: now, modified: now, pages: [newPage(paper)], resources: {} };
 }
 export function parseBook(text: string): Notebook {
   const b = JSON.parse(text);
   if (b.format !== 'penbook' || b.version !== 1 || !Array.isArray(b.pages) || !b.pages.length || typeof b.resources !== 'object' || !b.resources) throw new Error('无法识别笔记本格式或版本，原文件未被修改。');
   if (b.pages.length > 10000) throw new Error('页面数量超出支持范围。');
+  if (b.mode !== undefined && b.mode !== 'paged' && b.mode !== 'infinite') throw new Error('笔记本模式不受支持，原文件未被修改。');
+  if (b.viewport !== undefined) {
+    const vp = b.viewport;
+    if (!vp || typeof vp !== 'object' || Array.isArray(vp) || !Number.isFinite(vp.x) || !Number.isFinite(vp.y) || !Number.isFinite(vp.zoom) || vp.zoom <= 0 || (vp.showGuides !== undefined && typeof vp.showGuides !== 'boolean')) {
+      throw new Error('视口状态数据不完整，原文件未被修改。');
+    }
+    vp.zoom = Math.max(0.1, Math.min(5, vp.zoom));
+  }
+  if (b.bookmarks !== undefined) {
+    if (!Array.isArray(b.bookmarks)) throw new Error('视角书签数据不完整，原文件未被修改。');
+    for (const bm of b.bookmarks) {
+      if (!bm || typeof bm !== 'object' || Array.isArray(bm) || typeof bm.id !== 'string' || !bm.id || typeof bm.title !== 'string' || !Number.isFinite(bm.x) || !Number.isFinite(bm.y) || !Number.isFinite(bm.zoom) || bm.zoom <= 0) {
+        throw new Error('视角书签数据不完整，原文件未被修改。');
+      }
+      bm.zoom = Math.max(0.1, Math.min(5, bm.zoom));
+    }
+  }
+  if (b.mode === 'infinite') {
+    b.viewport ??= { x: 0, y: 0, zoom: 1, showGuides: false };
+    b.bookmarks ??= [];
+  }
   for (const p of b.pages) {
     if (!p.id || !Number.isFinite(p.width) || !Number.isFinite(p.height) || p.width < 10 || p.height < 10 || p.width > 10000 || p.height > 10000 || !Array.isArray(p.items)) throw new Error('页面数据不完整，原文件未被修改。');
     p.ocr ??= ''; p.pdfText ??= ''; p.tags ??= []; p.spacing ??= 28;

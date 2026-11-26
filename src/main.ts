@@ -1,5 +1,5 @@
 import { Plugin, PluginSettingTab, Setting, Notice, TFile, normalizePath, Menu, Modal } from 'obsidian';
-import { newBook, newPage, Notebook, Paper, Pen, InkProfile, clone, parseBook, isInfiniteBook, normalizeInfinitePaper } from './model';
+import { newBook, newPage, Notebook, Paper, Pen, InkProfile, clone, parseBook, normalizeInfinitePaper } from './model';
 import { notebookWizard, PAPER_NAMES, coverPreview, paperPreview } from './templates';
 import { PRESET_COLORS } from './palette';
 import { form, pickFile } from './dialogs';
@@ -10,6 +10,7 @@ import { SHORTCUTS, shortcutHint } from './shortcuts';
 import { SelectionClipboard } from './selection-clipboard';
 import { PenFavorite, normalizePenFavorites } from './pen-favorites';
 import { PenbookEmbedManager } from './embed';
+import { LibraryIndex } from './library-index';
 
 export interface Preferences {
   folder:string; paper:Paper; penColor:string; penWidth:number; pressure:number; fingerInk:boolean;
@@ -25,12 +26,14 @@ export default class PenbookPlugin extends Plugin {
   settings:Preferences={...DEFAULTS};
   selectionClipboard:SelectionClipboard|null=null;
   embedManager?:PenbookEmbedManager;
+  libraryIndex=new LibraryIndex();
   async onload(){
     registerIcons();
     this.register(installTooltips());
     this.settings={...DEFAULTS,...await this.loadData()};
     this.settings.presetColors=[...new Set([...this.settings.presetColors,...this.settings.customColors])];this.settings.inkProfiles={...this.settings.inkProfiles};this.settings.colorHistory=[...this.settings.colorHistory];
     this.settings.penFavorites=normalizePenFavorites(this.settings.penFavorites);this.settings.gridSnap=Boolean(this.settings.gridSnap);
+    await this.loadLibraryIndex();
     this.registerView(VIEW_TYPE,leaf=>new PenbookView(leaf,this));this.registerExtensions(['penbook'],VIEW_TYPE);
     this.addRibbonIcon('pb-pen','新建手写笔记本',()=>void this.createNotebook());
     this.addCommand({id:'new-notebook',name:'新建手写笔记本',callback:()=>void this.createNotebook()});
@@ -56,10 +59,30 @@ export default class PenbookPlugin extends Plugin {
     });
     this.embedManager=new PenbookEmbedManager(this);
     this.embedManager.register(this);
+    this.registerEvent(this.app.vault.on('modify',file=>{if(file instanceof TFile&&file.extension==='penbook')this.libraryIndex.invalidate(file.path);}));
+    this.registerEvent(this.app.vault.on('delete',file=>{if(file instanceof TFile&&file.extension==='penbook')this.libraryIndex.invalidate(file.path);}));
+    this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{if(file instanceof TFile){if(file.extension==='penbook')this.libraryIndex.rename(oldPath,file.path);else if(oldPath.endsWith('.penbook'))this.libraryIndex.invalidate(oldPath);}}));
     this.addSettingTab(new PenbookSettings(this));
   }
   onunload(){
     void this.embedManager?.unload();
+    this.libraryIndex.clear();
+  }
+  private libraryIndexPath(){return normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/library-index.json`);}
+  async loadLibraryIndex(){
+    try{
+      const path=this.libraryIndexPath();
+      await this.libraryIndex.load(async()=>{
+        if(!await this.app.vault.adapter.exists(path))return null;
+        return await this.app.vault.adapter.read(path);
+      });
+    }catch{/* Fallback cleanly to memory-only if adapter fails. */}
+  }
+  async saveLibraryIndex(){
+    try{
+      const path=this.libraryIndexPath();
+      await this.libraryIndex.save(data=>this.app.vault.adapter.write(path,data));
+    }catch{/* Fallback cleanly to memory-only if adapter fails. */}
   }
   asset(path:string){const url=this.app.vault.adapter.getResourcePath(normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${path}`));return path.endsWith('/')?url.split('?')[0].replace(/\/?$/,'/'):url;}
   async saveSettings(){await this.saveData(this.settings);}
@@ -89,21 +112,23 @@ class Library extends Modal {
   constructor(private plugin:PenbookPlugin){super(plugin.app);}
   async onOpen(){
     this.titleEl.setText('Penbook · 笔记本');const search=this.contentEl.createEl('input',{attr:{placeholder:'搜索名称、标签、书签、页面内容…',type:'search'}});search.addClass('pb-library-search');
-    const list=this.contentEl.createDiv('pb-library');const entries: {file:TFile;book:Notebook}[]=[];
-    for(const file of this.app.vault.getFiles().filter(f=>f.extension==='penbook').sort((a,b)=>b.stat.mtime-a.stat.mtime)){try{entries.push({file,book:parseBook(await this.app.vault.read(file))});}catch{/* Invalid files remain available in the vault. */}}
-    const draw=()=>{list.empty();const query=search.value.toLowerCase();for(const {file,book} of entries){if(query&&!`${book.title} ${book.tags.join(' ')} ${(book.bookmarks??[]).map(b=>b.title).join(' ')} ${book.pages.map(p=>p.title+' '+p.tags.join(' ')+' '+p.pdfText+' '+p.ocr+' '+p.items.map(o=>o.text??'').join(' ')).join(' ')}`.toLowerCase().includes(query))continue;
-      const isInf=isInfiniteBook(book);
+    const list=this.contentEl.createDiv('pb-library');
+    const files=this.app.vault.getFiles().filter(f=>f.extension==='penbook').sort((a,b)=>b.stat.mtime-a.stat.mtime);
+    const fileByPath=new Map(files.map(f=>[f.path,f]));
+    const entries=await this.plugin.libraryIndex.getEntries(files,file=>this.app.vault.read(file));
+    if(this.plugin.libraryIndex.dirty)void this.plugin.saveLibraryIndex();
+    const draw=()=>{list.empty();const query=search.value.toLowerCase();for(const entry of entries){if(query&&!entry.searchText.includes(query))continue;
       const card=list.createEl('button',{cls:'pb-library-card'});const cover=card.createDiv({cls:'pb-book-cover'});
-      if(isInf){
+      if(entry.isInfinite){
         cover.addClass('pb-book-cover-infinite');
-        if(book.hasCover!==false)coverPreview(cover,book);else paperPreview(cover,book.pages[0],true);
+        if(entry.hasCover!==false)coverPreview(cover,entry);else paperPreview(cover,{...newPage(entry.firstPagePaper),color:entry.firstPageColor,spacing:entry.firstPageSpacing},true);
         cover.createSpan({cls:'pb-infinite-badge',text:'∞ 无界'});
       }else{
-        if(book.hasCover!==false)coverPreview(cover,book);else cover.style.background=book.pages[0].color;
+        if(entry.hasCover!==false)coverPreview(cover,entry);else cover.style.background=entry.firstPageColor;
       }
-      card.createEl('strong',{text:book.title});
-      card.createEl('small',{text:isInf?`无界笔记${book.bookmarks?.length?` · ${book.bookmarks.length} 个书签`:''} · ${file.path}`:`${book.pages.length} 页 · ${file.path}`});
-      card.onclick=async()=>{this.close();await this.app.workspace.getLeaf(false).openFile(file);};}
+      card.createEl('strong',{text:entry.title});
+      card.createEl('small',{text:entry.isInfinite?`无界笔记${entry.bookmarkCount?` · ${entry.bookmarkCount} 个书签`:''} · ${entry.path}`:`${entry.pageCount} 页 · ${entry.path}`});
+      card.onclick=async()=>{const file=fileByPath.get(entry.path);this.close();if(file)await this.app.workspace.getLeaf(false).openFile(file);};}
       if(!list.children.length)list.createEl('p',{text:'没有匹配的笔记本。使用左侧钢笔按钮新建。'});
     };search.oninput=draw;draw();
   }

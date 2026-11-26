@@ -82,8 +82,9 @@ export class Renderer {
     if(o.pdfNative?.baselineStyle&&img&&o.pdfNative.baselineStyle===nativeTextStyle(o)){ctx.drawImage(img,0,0,w,h);ctx.restore();return;}
     if (o.kind==='stroke') {
       const profile=o.ink,style=o.strokeStyle??profile?.style??'solid';
+      const lineMarkup=!o.frozenInk&&['Underline','StrikeOut','Squiggly'].includes(o.pdfMarkup?.subtype??'');
       if(o.eraseMasks?.length||o.frozenInk&&style!=='solid'){const cached=this.clip(o);if(cached.inkPath)ctx.clip(cached.inkPath,'evenodd');ctx.clip(cached.path,'evenodd');}
-      if(style!=='solid'){ctx.setLineDash(style==='dashed'?[ctx.lineWidth*4,ctx.lineWidth*2]:[.1,ctx.lineWidth*2]);const points=o.points??[];if(points.length){ctx.beginPath();ctx.moveTo(points[0][0],points[0][1]);for(const p of points.slice(1))ctx.lineTo(p[0],p[1]);ctx.stroke();}ctx.restore();return;}
+      if(lineMarkup||style!=='solid'){if(lineMarkup)ctx.lineWidth=o.width??1.5;if(style!=='solid')ctx.setLineDash(style==='dashed'?[ctx.lineWidth*4,ctx.lineWidth*2]:[.1,ctx.lineWidth*2]);const points=o.points??[];if(points.length){ctx.beginPath();ctx.moveTo(points[0][0],points[0][1]);for(const p of points.slice(1))ctx.lineTo(p[0],p[1]);ctx.stroke();}ctx.restore();return;}
       if(o.frozenInk){const cached=this.clip(o);ctx.fill(cached.inkPath??cached.path,'evenodd');ctx.restore();return;}
       const pts = this.strokeOutline(o);
       if (pts.length) { ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]); for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]); ctx.closePath(); ctx.fill(); }

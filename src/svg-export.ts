@@ -8,7 +8,8 @@ export const escapeXml=(s:string)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').
 const number=(value:number)=>Math.abs(value)<.000001?'0':value.toFixed(6).replace(/\.?0+$/,'');
 const ringPath=(rings:number[][][])=>rings.map(points=>points.map((p,i)=>`${i?'L':'M'}${number(p[0])},${number(p[1])}`).join(' ')+'Z').join(' ');
 export function itemSvg(o:Item,book:Notebook,renderer:Renderer,ctx:CanvasRenderingContext2D,id:string):string {
-  const w=o.bw,h=o.bh,color=escapeXml(o.color),width=o.width??2;
+  const lineMarkup=o.kind==='stroke'&&!o.frozenInk&&['Underline','StrikeOut','Squiggly'].includes(o.pdfMarkup?.subtype??'');
+  const w=o.bw,h=o.bh,color=escapeXml(o.color),width=o.width??(lineMarkup?1.5:2);
   const transform=`translate(${o.x+o.w/2} ${o.y+o.h/2}) rotate(${o.rotation}) translate(${-o.w/2} ${-o.h/2}) scale(${o.w/w} ${o.h/h})`;
   const dash=o.strokeStyle??o.ink?.style??'solid',stroke=`stroke="${color}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round"${dash==='solid'?'':` stroke-dasharray="${dash==='dashed'?`${width*4} ${width*2}`:`0.1 ${width*2}`}"`}`;
   let content='',defs='';
@@ -22,10 +23,11 @@ export function itemSvg(o:Item,book:Notebook,renderer:Renderer,ctx:CanvasRenderi
     return `<text x="${x}" y="${y}" dominant-baseline="hanging" text-anchor="${anchor}" fill="${color}" font-family="${escapeXml(o.font??'sans-serif')}" font-size="${size}"${o.bold?' font-weight="bold"':''}${o.italic?' font-style="italic"':''}>${lines.map((line,i)=>`<tspan x="${x}" dy="${i?size*(o.lineHeight??(o.kind==='table'?1.25:1.4)):0}">${escapeXml(line)}</tspan>`).join('')}</text>`;
   };
   if(o.kind==='stroke'){
+    const stroked=lineMarkup||dash!=='solid';
     let path:string;
-    if(dash==='solid')path=ringPath(o.frozenInk??[renderer.strokeOutline(o)]);
-    else path=(o.points??[]).map((p,i)=>`${i?'L':'M'}${p[0]},${p[1]}`).join(' ');
-    content=`<path d="${path}" ${dash==='solid'?`fill="${color}" fill-rule="evenodd"`:`fill="none" ${stroke}`}/>`;
+    if(!stroked)path=ringPath(o.frozenInk??[renderer.strokeOutline(o)]);
+    else path=(o.points??[]).map((p,i)=>`${i?'L':'M'}${number(p[0])},${number(p[1])}`).join(' ');
+    content=`<path d="${path}" ${!stroked?`fill="${color}" fill-rule="evenodd"`:`fill="none" ${stroke}`}/>`;
     if(o.eraseMasks?.length||o.frozenInk&&dash!=='solid'){
       defs+=`<clipPath id="erase-${id}"><path d="${erasureClipPath(o)}" clip-rule="evenodd"/></clipPath>`;
       content=`<g clip-path="url(#erase-${id})">${content}</g>`;

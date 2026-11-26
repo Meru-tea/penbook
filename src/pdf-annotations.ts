@@ -22,14 +22,15 @@ const rgb=(color:string)=>/^#[0-9a-f]{6}$/i.test(color)?[1,3,5].map(i=>parseInt(
 const number=(value:number)=>Math.abs(value)<.000001?'0':value.toFixed(6).replace(/\.?0+$/,'');
 const path=(points:number[][],close=false)=>points.map((p,i)=>`${number(p[0])} ${number(p[1])} ${i?'l':'m'}`).join('\n')+(close?'\nh':'');
 const clipCommands=(d:string)=>d.replace(/[ML]\s*(-?[\d.]+(?:e[+-]?\d+)?)[, ]+(-?[\d.]+(?:e[+-]?\d+)?)/gi,(command,x,y)=>`${number(Number(x))} ${number(Number(y))} ${command[0].toUpperCase()==='M'?'m':'l'}\n`).replace(/Z/gi,'h\n');
-function vectorAppearance(o:Item,renderer:Renderer):string|undefined{
-  const w=o.bw,h=o.bh,width=o.width??2,color=rgb(o.color).join(' '),style=o.strokeStyle??o.ink?.style??'solid';
+export function vectorAppearance(o:Item,renderer:Renderer):string|undefined{
+  const lineMarkup=o.kind==='stroke'&&!o.frozenInk&&['Underline','StrikeOut','Squiggly'].includes(o.pdfMarkup?.subtype??'');
+  const w=o.bw,h=o.bh,width=o.width??(lineMarkup?1.5:2),color=rgb(o.color).join(' '),style=o.strokeStyle??o.ink?.style??'solid';
   let ops=`${color} rg ${color} RG ${width} w 1 J 1 j\n`;
   if(o.pdfMarkup?.subtype==='Highlight')ops+='/Multiply gs\n';
   if(style!=='solid')ops+=`[${style==='dashed'?`${width*4} ${width*2}`:`0.1 ${width*2}`}] 0 d\n`;
   if(o.kind==='stroke'){
     if(o.eraseMasks?.length||o.frozenInk&&style!=='solid')ops+=clipCommands(erasureClipPath(o))+'W* n\n';
-    return ops+(style==='solid'?(o.frozenInk??[renderer.strokeOutline(o)]).map(r=>path(r,true)).join('\n')+'\nf*':path(o.points??[])+'\nS');
+    return ops+(style==='solid'&&!lineMarkup?(o.frozenInk??[renderer.strokeOutline(o)]).map(r=>path(r,true)).join('\n')+'\nf*':path(o.points??[])+'\nS');
   }
   if(o.kind==='tape')return ops+(o.points?path(getStroke(o.points,{size:o.width??24,thinning:0,simulatePressure:false}),true):`0 0 ${w} ${h} re`)+'\nf';
   if(o.kind!=='shape')return;

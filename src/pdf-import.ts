@@ -21,22 +21,65 @@ export async function destinationPage(pdf:PDFDocumentProxy,dest:any):Promise<num
   if(!Array.isArray(value)||!value.length)return;
   try{return typeof value[0]==='number'?value[0]:await pdf.getPageIndex(value[0]);}catch{return;}
 }
+const clampOpacity=(value:unknown,fallback:number)=>typeof value==='number'&&Number.isFinite(value)?Math.max(0,Math.min(1,value)):fallback;
+type Pt=[number,number,number];
+const normalizeQuad=(pts:Pt[]):[Pt,Pt,Pt,Pt]=>{
+  const byY=[...pts].sort((u,v)=>u[1]-v[1]||u[0]-v[0]);
+  const [tl,tr]=byY.slice(0,2).sort((u,v)=>u[0]-v[0]||u[1]-v[1]);
+  const [bl,br]=byY.slice(2,4).sort((u,v)=>u[0]-v[0]||u[1]-v[1]);
+  return[tl,tr,bl,br];
+};
+const lerpPt=(a:Pt,b:Pt,t:number):Pt=>[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,.5];
+function squigglyPoints(start:Pt,end:Pt,size:number):Pt[]{
+  const dx=end[0]-start[0],dy=end[1]-start[1],len=Math.hypot(dx,dy);
+  if(len<1e-3)return[start,end];
+  const wavelength=Math.max(4,size*.28),amplitude=Math.max(1.2,size*.09),nx=-dy/len,ny=dx/len;
+  const count=Math.max(4,Math.ceil(len/(wavelength/4))),pts:Pt[]=[];
+  for(let i=0;i<=count;i++){
+    const t=i/count,bx=start[0]+dx*t,by=start[1]+dy*t;
+    const offset=i===0||i===count?0:Math.sin((t*len/wavelength)*Math.PI*2)*amplitude;
+    pts.push([bx+nx*offset,by+ny*offset,.5]);
+  }
+  return pts;
+}
 export function annotationItems(annotation:any,p:PDFPageProxy):Item[]{
   const vp=p.getViewport({scale:1}),rect=annotation.rect as number[]|undefined;if(!rect?.every(Number.isFinite))return [];
   const [ax,ay]=vp.convertToViewportPoint(rect[0],rect[1]),[bx,by]=vp.convertToViewportPoint(rect[2],rect[3]),x=Math.min(ax,bx),y=Math.min(ay,by),w=Math.max(1,Math.abs(bx-ax)),h=Math.max(1,Math.abs(by-ay));
   const ink=color(annotation.color),contents=annotation.contentsObj?.str??annotation.contents??'',lineWidth=Math.max(.2,annotation.borderStyle?.width??1);
-  const points=(values:ArrayLike<number>)=>{const result:[number,number,number][]=[];for(let i=0;i+1<values.length;i+=2){const pt=vp.convertToViewportPoint(values[i],values[i+1]);result.push([pt[0],pt[1],.5]);}return result;};
+  const points=(values:ArrayLike<number>)=>{const result:Pt[]=[];for(let i=0;i+1<values.length;i+=2){const pt=vp.convertToViewportPoint(values[i],values[i+1]);result.push([pt[0],pt[1],.5]);}return result;};
   let result:Item[]=[];
-  if(annotation.annotationType===3)result=[{...item('text',x,y,w,h,color(annotation.defaultAppearanceData?.fontColor)),text:contents,fontSize:annotation.defaultAppearanceData?.fontSize??16}];
-  else if(annotation.annotationType===15){for(const list of annotation.inkLists??[]){const pts=points(list);if(pts.length)result.push(stroke(pts,ink,lineWidth,'ballpoint'));}}
-  else if(annotation.annotationType===9){
+  const isMarkup=[9,10,11,12].includes(annotation.annotationType)||['Highlight','Underline','StrikeOut','Squiggly'].includes(annotation.subtype);
+  if(annotation.annotationType===3)result=[{...item('text',x,y,w,h,color(annotation.defaultAppearanceData?.fontColor)),text:contents,fontSize:annotation.defaultAppearanceData?.fontSize??16,opacity:clampOpacity(annotation.opacity,1)}];
+  else if(annotation.annotationType===15){for(const list of annotation.inkLists??[]){const pts=points(list);if(pts.length)result.push({...stroke(pts,ink,lineWidth,'ballpoint'),opacity:clampOpacity(annotation.opacity,1)});}}
+  else if(isMarkup){
+    const subtype=annotation.subtype??(annotation.annotationType===10?'Underline':annotation.annotationType===11?'Squiggly':annotation.annotationType===12?'StrikeOut':undefined);
     const quads=annotation.quadPoints??[rect[0],rect[3],rect[2],rect[3],rect[0],rect[1],rect[2],rect[1]];
-    for(let i=0;i<quads.length;i+=8){const pts=points(Array.from(quads).slice(i,i+8)as number[]);if(pts.length!==4)continue;const middle=(a:number,b:number):[number,number,number]=>[(pts[a][0]+pts[b][0])/2,(pts[a][1]+pts[b][1])/2,.5];
-      const a=middle(0,2),b=middle(1,3),size=Math.max(1,Math.hypot(pts[0][0]-pts[2][0],pts[0][1]-pts[2][1]));
-      const o=stroke([a,b],ink,size,'highlighter');o.pdfMarkup={subtype:annotation.subtype,quadPoints:pts.map(v=>[v[0]-o.x,v[1]-o.y,v[2]])};o.frozenInk=[[pts[0],pts[1],pts[3],pts[2]].map(v=>[v[0]-o.x,v[1]-o.y])];result.push(o);
+    for(let i=0;i<quads.length;i+=8){
+      const raw=points(Array.from(quads).slice(i,i+8)as number[]);if(raw.length!==4)continue;
+      const quad=normalizeQuad(raw),[tl,tr,bl,br]=quad;
+      const size=Math.max(1,(Math.hypot(tl[0]-bl[0],tl[1]-bl[1])+Math.hypot(tr[0]-br[0],tr[1]-br[1]))/2);
+      if(subtype==='Underline'||subtype==='StrikeOut'||subtype==='Squiggly'){
+        const linePts:Pt[]=subtype==='StrikeOut'?[lerpPt(tl,bl,.5),lerpPt(tr,br,.5)]:subtype==='Squiggly'?squigglyPoints(lerpPt(tl,bl,.92),lerpPt(tr,br,.92),size):[lerpPt(tl,bl,.92),lerpPt(tr,br,.92)];
+        const width=subtype==='Squiggly'?Math.max(.8,size*.07):Math.max(1,size*.08);
+        const all=[...quad,...linePts];let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+        for(const[px,py]of all){minX=Math.min(minX,px);minY=Math.min(minY,py);maxX=Math.max(maxX,px);maxY=Math.max(maxY,py);}
+        const ox=minX-width,oy=minY-width,ow=Math.max(1,maxX-ox+width),oh=Math.max(1,maxY-oy+width);
+        const o=stroke(linePts,ink,width,'ballpoint');
+        o.x=ox;o.y=oy;o.w=ow;o.h=oh;o.bw=ow;o.bh=oh;
+        o.points=linePts.map(v=>[v[0]-ox,v[1]-oy,v[2]]);
+        o.pdfMarkup={subtype,quadPoints:quad.map(v=>[v[0]-ox,v[1]-oy,v[2]])};
+        o.opacity=clampOpacity(annotation.opacity,1);
+        result.push(o);
+      }else{
+        const a=lerpPt(tl,bl,.5),b=lerpPt(tr,br,.5),o=stroke([a,b],ink,size,'highlighter');
+        o.pdfMarkup={subtype,quadPoints:quad.map(v=>[v[0]-o.x,v[1]-o.y,v[2]])};
+        o.frozenInk=[[tl,tr,br,bl].map(v=>[v[0]-o.x,v[1]-o.y])];
+        o.opacity=clampOpacity(annotation.opacity,.35);
+        result.push(o);
+      }
     }
   }
-  return result.map(o=>({...o,pdfAnnotationId:annotation.id,pdfMarkup:{...o.pdfMarkup,subtype:annotation.subtype,contents,author:annotation.titleObj?.str,subject:annotation.subject,lineEndings:annotation.lineEndings},opacity:annotation.opacity??1}));
+  return result.map(o=>({...o,pdfAnnotationId:annotation.id,pdfMarkup:{...o.pdfMarkup,subtype:o.pdfMarkup?.subtype??annotation.subtype,contents,author:annotation.titleObj?.str,subject:annotation.subject,lineEndings:annotation.lineEndings}}));
 }
 export async function importPdfPages(pdf:PDFDocumentProxy,key:string,name:string,book:Notebook):Promise<Page[]>{
   const pages:Page[]=[],pending:{page:Page;link:NonNullable<Page['pdfLinks']>[number];dest:any}[]=[];

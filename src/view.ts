@@ -33,7 +33,30 @@ const AUTO_SHAPE_MOVE_THRESHOLD=8;
 type Tool='pen'|'eraser'|'lasso'|'shape'|'text'|'sticky'|'link'|'table'|'hand'|'laser'|'tape';
 interface Surface {page:Page;sheet:HTMLElement;bg:HTMLCanvasElement;ink:HTMLCanvasElement;ui:HTMLCanvasElement;text:HTMLElement;epoch:number;visible?:boolean;backgroundReady?:boolean;controller?:AbortController;paintVersion?:number;images?:Map<string,HTMLImageElement>;}
 interface SelectionFrame {cx:number;cy:number;w:number;h:number;angle:number;}
-interface Gesture {pointer:number;pointerType?:string;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;panX?:number;panY?:number;lastMoved?:number;holdPoint?:Point;snapped?:Item;snappedBase?:Item;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
+interface Gesture {pointer:number;pointerType?:string;surface:Surface;tool:Tool;points:Point[];start:Point;last:Point;panX?:number;panY?:number;lastMoved?:number;holdPoint?:Point;snapped?:Item;snappedBase?:Item;penHoldBefore?:Tool;edited?:boolean;erasedStrokes?:Set<string>;eraseOutlines?:Map<string,number[][]>;eraseSession?:string;eraseQueue?:{from:Point;to:Point}[];erasePending?:Promise<void>;ending?:Promise<void>;finalized?:boolean;mode?:'move'|'resize'|'rotate';original?:Item[];frame?:SelectionFrame;before?:Snapshot;}
+
+export function mapPointerPressure(pressure:number|undefined,pointerType:string|undefined,gamma:number){
+  const raw=typeof pressure==='number'&&Number.isFinite(pressure)?(pointerType==='mouse'&&pressure===0?0.5:pressure):0.5;
+  return Math.pow(Math.max(.05,raw),gamma);
+}
+
+export function infiniteEraserClipRegion(x:number,y:number,w:number,h:number,zoom:number,dpr:number):Rect{
+  const pad=2/Math.max(0.05,zoom*dpr);
+  return{x:x-pad,y:y-pad,w:w+pad*2,h:h+pad*2};
+}
+
+export function isIncipientTouchGesture(g:{pointerType?:string;points:Point[];start:Point;last:Point;snapped?:Item;edited?:boolean;erasedStrokes?:Set<string>},zoom:number){
+  if(g.pointerType!=='touch'||g.snapped||g.edited||g.erasedStrokes?.size)return false;
+  if(g.points.length>10)return false;
+  const limit=28/Math.max(0.1,zoom);
+  if(Math.hypot(g.last[0]-g.start[0],g.last[1]-g.start[1])>=limit)return false;
+  let path=0;
+  for(let i=1;i<g.points.length;i++){
+    path+=Math.hypot(g.points[i][0]-g.points[i-1][0],g.points[i][1]-g.points[i-1][1]);
+    if(path>=limit)return false;
+  }
+  return true;
+}
 
 export class PenbookView extends TextFileView {
   book:Notebook=newBook();index=0;valid=false;raw='';
@@ -53,8 +76,9 @@ export class PenbookView extends TextFileView {
   get clipboard(){return this.plugin.selectionClipboard;}
   set clipboard(value:SelectionClipboard|null){this.plugin.selectionClipboard=value;}
   touches=new Map<number,{x:number;y:number}>();pinch?:{distance:number;zoom:number;cx:number;cy:number};lastPen=0;
+  private touchPinching=false;
   renderEpoch=0;thumbEpoch=0;closed=false;sidebarQuery='';penButtons=new Map<Tool,HTMLButtonElement>();resizeObserver?:ResizeObserver;
-  private saveTimer?:number;private dirty=false;private saving:Promise<void>=Promise.resolve();
+  private saveTimer?:number;private dirty=false;private dirtyVersion=0;private inFlightWrite?:string;private saving:Promise<void>=Promise.resolve();
   private wasActive=false;
   private pageObservers:IntersectionObserver[]=[];private thumbObservers:IntersectionObserver[]=[];
   private toolbarLeft!:HTMLElement;private toolbarRight!:HTMLElement;private toolbarScrollWrap!:HTMLElement;private contextRow!:HTMLElement;private historyEl!:HTMLElement;
@@ -90,14 +114,33 @@ export class PenbookView extends TextFileView {
   getViewData(){if(!this.valid)return this.raw;if(!this.dirty&&!this.gesture&&this.raw)return this.raw;return JSON.stringify(this.book);}
   setViewData(data:string,clear:boolean){
     // Vault echoes our own saves; rebuilding here would discard an active text editor.
-    if(!clear&&this.valid&&(data===this.lastWritten||data===this.raw&&!this.dirty&&!this.gesture))return;
+    if(!clear&&this.valid&&(data===this.lastWritten||data===this.inFlightWrite||(data===this.raw&&!this.dirty&&!this.gesture)))return;
+    if(!clear&&this.valid&&(this.dirty||this.gesture)){
+      if(data===this.raw)return;
+      this.raw=data;
+      this.dirty=true;
+      const file=this.file;
+      if(file&&this.plugin?.unique&&this.app?.vault?.create){
+        const dir=file.parent?.path&&file.parent.path!=='/'?file.parent.path:'';
+        const stamp=new Date().toISOString().replace(/[:.]/g,'-');
+        const candidate=`${dir?dir+'/':''}${file.basename}.sync-conflict-${stamp}.penbook`;
+        void this.run(async()=>{
+          const path=await this.plugin.unique(candidate);
+          await this.app.vault.create(path,data);
+          new Notice('检测到云端同步变更，已保留本地未保存笔迹并将远端版本另存为冲突备份');
+        });
+      }else{
+        new Notice('检测到云端同步变更，已保留本地未保存笔迹并将远端版本另存为冲突备份');
+      }
+      return;
+    }
     if(clear)this.clear();this.raw=data;
     try{this.book=parseBook(data);this.valid=true;this.index=Math.min(this.index,this.book.pages.length-1);
       if(this.infinite){const vp=this.book.viewport??{x:0,y:0,zoom:1,showGuides:false};this.camera={x:vp.x,y:vp.y,zoom:clampInfiniteZoom(vp.zoom)};this.zoom=this.camera.zoom;this.showGuides=Boolean(vp.showGuides);}
       this.selection.clear();this.renderer.clear();void this.pdfs.clear();this.render();}
     catch(error){this.valid=false;this.contentEl.empty();this.contentEl.createDiv({cls:'pb-error',text:String(error)});}
   }
-  clear(){this.finishGesture(false);this.releaseSurfaces();this.thumbsController?.abort();this.snapshots.clear();this.undoStack=[];this.redoStack=[];this.selection.clear();this.index=0;this.valid=false;this.renderer.clear();void this.pdfs.clear();if(this.saveTimer)window.clearTimeout(this.saveTimer);this.dirty=false;this.lastWritten=undefined;
+  clear(){this.cancelPenHold();this.finishGesture(false);this.touches.clear();this.pinch=undefined;this.infinitePinch=undefined;this.touchPinching=false;this.releaseSurfaces();this.thumbsController?.abort();this.snapshots.clear();this.undoStack=[];this.redoStack=[];this.selection.clear();this.index=0;this.valid=false;this.renderer.clear();void this.pdfs.clear();if(this.saveTimer)window.clearTimeout(this.saveTimer);this.saveTimer=undefined;this.dirty=false;this.dirtyVersion=0;this.lastWritten=undefined;this.inFlightWrite=undefined;
     this.pdfSearch?.destroy();this.pdfSearch=undefined;this.activeGuides=[];this.activeBookmarkId=undefined;
     this.camera={x:0,y:0,zoom:1};this.showGuides=false;this.minimapVisible=false;this.spacePanning=false;this.middlePan=undefined;this.infinitePinch=undefined;this.sidebarInitBook=undefined;if(this.cameraSaveTimer!==undefined){window.clearTimeout(this.cameraSaveTimer);this.cameraSaveTimer=undefined;}if(this.infiniteFrame!==undefined){cancelAnimationFrame(this.infiniteFrame);this.infiniteFrame=undefined;}}
   async onOpen(){this.closed=false;this.contentEl.addClass('pb-view-content');
@@ -121,20 +164,28 @@ export class PenbookView extends TextFileView {
   }
   async onClose(){rememberAnchor(null);this.pdfSearch?.destroy();this.pdfSearch=undefined;this.activeGuides=[];this.activeBookmarkId=undefined;if(this.laserFrame!==undefined)cancelAnimationFrame(this.laserFrame);this.laserFrame=undefined;this.laserTrail=undefined;if(this.infiniteFrame!==undefined){cancelAnimationFrame(this.infiniteFrame);this.infiniteFrame=undefined;}if(this.cameraSaveTimer!==undefined){window.clearTimeout(this.cameraSaveTimer);this.cameraSaveTimer=undefined;}this.spacePanning=false;this.middlePan=undefined;await this.savePendingEdits();this.releaseSurfaces();this.thumbsController?.abort();this.undoStack=[];this.redoStack=[];this.snapshots.clear();this.thumbPainters.clear();this.pageCards.clear();this.sidebarItems.clear();this.pendingThumbs.clear();this.uiTheme=undefined;this.backgroundEraser.stop();this.closed=true;this.renderEpoch++;this.thumbEpoch++;this.pageObservers.forEach(o=>o.disconnect());this.thumbObservers.forEach(o=>o.disconnect());await this.pdfs.clear();this.renderer.clear();}
   async onUnloadFile(file:TFile){await this.savePendingEdits();await super.onUnloadFile(file);}
+  async flushPending(){await this.savePendingEdits();}
   private async savePendingEdits(){this.inlineEditor?.finish(true);await this.finishGesture(true);if(this.infinite&&this.valid)this.syncViewportToBook();await this.flush();}
   private async run(fn:()=>void|Promise<void>){try{await fn();}catch(error){if(error instanceof Error&&['AbortError','RenderingCancelledException'].includes(error.name))return;console.error('Penbook',error);new Notice(`Penbook：${error instanceof Error?error.message:String(error)}`);}}
   private snapshot():Snapshot{return this.snapshots.capture(this.book);}
   private trimHistory(){while(this.undoStack.length>1&&(this.undoStack.length+this.redoStack.length>50||historyWeight([...this.undoStack,...this.redoStack])>64*1024*1024))this.undoStack.shift();while(this.redoStack.length>1&&(this.undoStack.length+this.redoStack.length>50||historyWeight([...this.undoStack,...this.redoStack])>64*1024*1024))this.redoStack.shift();}
   private push(before:Snapshot){this.undoStack.push(before);this.redoStack=[];this.trimHistory();}
-  private changed(before?:Snapshot){if(before)this.push(before);this.updateHistory();this.book.modified=new Date().toISOString();this.dirty=true;if(this.saveTimer)window.clearTimeout(this.saveTimer);this.saveTimer=window.setTimeout(()=>void this.flush(),650);this.updateSelectionBar();}
+  private changed(before?:Snapshot){if(before)this.push(before);this.updateHistory();this.book.modified=new Date().toISOString();this.dirty=true;this.dirtyVersion=(this.dirtyVersion??0)+1;if(this.saveTimer)window.clearTimeout(this.saveTimer);this.saveTimer=window.setTimeout(()=>void this.flush(),650);this.updateSelectionBar();}
   private async flush(){if(!this.valid||!this.dirty||!this.file){await this.saving;return;}if(this.saveTimer)window.clearTimeout(this.saveTimer);this.saveTimer=undefined;
     if(this.gesture){this.saveTimer=window.setTimeout(()=>void this.flush(),650);return;}
-    const file=this.file, data=this.getViewData();this.lastWritten=data;this.raw=data;this.dirty=false;
+    const file=this.file,writeVersion=this.dirtyVersion,data=this.getViewData();this.inFlightWrite=data;
     this.saving=this.saving.catch(()=>{}).then(async()=>{
       try{JSON.parse(data);}catch(error){throw new Error('笔记本数据校验失败，已放弃本次写入');}
+      if(this.file===file&&!this.dirty&&this.lastWritten===data)return;
       await this.app.vault.modify(file,data);
+      if(this.file===file){
+        this.lastWritten=data;this.raw=data;
+        if(this.dirtyVersion===writeVersion)this.dirty=false;
+      }
     });
-    try{await this.saving;}catch(error){this.dirty=true;new Notice('保存失败，请保持笔记本打开并检查存储空间。');console.error(error);}
+    try{await this.saving;}catch(error){if(this.file===file)this.dirty=true;new Notice('保存失败，请保持笔记本打开并检查存储空间。');console.error(error);}
+    finally{if(this.inFlightWrite===data)this.inFlightWrite=undefined;}
+    if(!this.closed&&this.file===file&&this.dirty&&this.valid&&!this.saveTimer){this.saveTimer=window.setTimeout(()=>void this.flush(),650);}
   }
   get page(){return this.book.pages[this.index];}
   async undo(){await this.finishGesture(true);const b=this.undoStack.pop();if(!b)return;this.redoStack.push(this.snapshot());this.trimHistory();Object.assign(this.book,clone(b));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();this.changed();this.render(true);}
@@ -396,7 +447,7 @@ export class PenbookView extends TextFileView {
     const next={x:Math.round(this.camera.x*100)/100,y:Math.round(this.camera.y*100)/100,zoom:clampInfiniteZoom(this.camera.zoom),showGuides:this.showGuides};
     const old=this.book.viewport;
     if(old&&old.x===next.x&&old.y===next.y&&Math.abs(old.zoom-next.zoom)<1e-4&&Boolean(old.showGuides)===next.showGuides)return;
-    this.book.viewport=next;this.book.modified=new Date().toISOString();this.dirty=true;
+    this.book.viewport=next;this.book.modified=new Date().toISOString();this.dirty=true;this.dirtyVersion=(this.dirtyVersion??0)+1;
   }
   private persistViewport(){
     if(!this.infinite||!this.valid)return;
@@ -489,7 +540,7 @@ export class PenbookView extends TextFileView {
   }
   private bindSurfaceEvents(s:Surface){
     const {ui,page:p}=s;
-    ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;s.sheet.removeClass('is-panning');return;}const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
+    ui.addEventListener('pointerdown',e=>this.pointerDown(e,s));ui.addEventListener('pointermove',e=>this.pointerMove(e,s));ui.addEventListener('pointerup',e=>this.pointerUp(e));ui.addEventListener('pointercancel',e=>this.pointerCancel(e));ui.addEventListener('pointerleave',()=>{if(!this.gesture){this.hover=undefined;this.paintUI(s);}});ui.addEventListener('lostpointercapture',e=>{if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;s.sheet.removeClass('is-panning');return;}this.cleanupLostTouch(e.pointerId);const g=this.gesture;if(!g||g.pointer!==e.pointerId||g.ending)return;this.cancelPenHold();const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);});
     ui.addEventListener('contextmenu',e=>{e.preventDefault();if(this.lastPointerType==='pen'||this.penHoldFired){this.penHoldFired=false;return;}this.pageMenu(e);});ui.addEventListener('dblclick',e=>{if(this.reading)return;const pt=this.point(e,s),o=[...p.items].reverse().find(o=>contains(o,pt[0],pt[1]));if(o)void this.run(()=>this.editItem(o,pt));});
     let press:{x:number;y:number}|undefined;
     ui.addEventListener('pointerdown',e=>press={x:e.clientX,y:e.clientY});
@@ -650,8 +701,8 @@ export class PenbookView extends TextFileView {
       ctx.setTransform(1,0,0,1,0,0);
       ctx.clearRect(sx0*dpr-2,sy0*dpr-2,(sx1-sx0)*dpr+4,(sy1-sy0)*dpr+4);
       ctx.save();ctx.setTransform(dpr,0,0,dpr,0,0);ctx.translate(view.w/2,view.h/2);ctx.scale(z,z);ctx.translate(-this.camera.x,-this.camera.y);
-      ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
-      const region:Rect={x,y,w,h};
+      const region=infiniteEraserClipRegion(x,y,w,h,z,dpr);
+      ctx.beginPath();ctx.rect(region.x,region.y,region.w,region.h);ctx.clip();
       for(const o of filterVisibleItems(s.page.items,region,this.plugin.settings.showResolved,this.inlineEditingId)){
         this.renderer.draw(ctx,o,o.resource?s.images?.get(o.resource)??this.renderer.cachedImage(o.resource):undefined);
       }
@@ -790,8 +841,8 @@ export class PenbookView extends TextFileView {
     const tick=()=>{const trail=this.laserTrail;if(!trail||!trail.surface.ui.isConnected||this.closed){this.laserTrail=undefined;this.laserFrame=undefined;return;}if(trail.releasedAt!==undefined&&performance.now()-trail.releasedAt>=1000){this.laserTrail=undefined;this.laserFrame=undefined;this.paintUI(trail.surface);return;}this.paintUI(trail.surface);this.laserFrame=trail.releasedAt!==undefined?requestAnimationFrame(tick):undefined;};
     this.laserFrame=requestAnimationFrame(tick);
   }
-  private point(e:{clientX:number;clientY:number;pressure?:number},s:Surface):Point{
-    const r=s.sheet.getBoundingClientRect(),p=Math.pow(Math.max(.05,e.pressure||.5),this.plugin.settings.pressure);
+  private point(e:{clientX:number;clientY:number;pressure?:number;pointerType?:string},s:Surface):Point{
+    const r=s.sheet.getBoundingClientRect(),p=mapPointerPressure(e.pressure,e.pointerType,this.plugin.settings.pressure);
     if(this.infinite){
       const [wx,wy]=screenToWorld(e.clientX-r.left,e.clientY-r.top,this.camera,{w:r.width||this.stageSize().w,h:r.height||this.stageSize().h});
       return[wx,wy,p];
@@ -799,30 +850,58 @@ export class PenbookView extends TextFileView {
     return[(e.clientX-r.left)*s.page.width/r.width,(e.clientY-r.top)*s.page.height/r.height,p];
   }
   private activate(s:Surface){if(s.page.id===this.page.id)return;const previous=this.surfaces.find(v=>v.page===this.page),hadSelection=this.selection.size>0;this.index=this.book.pages.indexOf(s.page);this.selection.clear();if(hadSelection&&previous?.visible)this.paintUI(previous);this.drawSidebar();this.drawFooter();this.updateSelectionBar();this.surfaces.forEach(v=>v.sheet.toggleClass('is-active',v===s));}
+  private startPinchFromTouches(){
+    if(this.touches.size!==2)return;
+    const[a,b]=[...this.touches.values()];
+    const dist=Math.hypot(a.x-b.x,a.y-b.y);
+    if(this.infinite){
+      const r=this.stage.getBoundingClientRect();
+      this.infinitePinch={distance:dist,camera:{...this.camera},mid:[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top]};
+    }else{
+      this.pinch={distance:dist,zoom:this.zoom,cx:(a.x+b.x)/2,cy:(a.y+b.y)/2};
+    }
+  }
+  private cleanupLostTouch(pointerId:number){
+    if(!this.touches.has(pointerId))return;
+    const wasPinching=this.touchPinching,nonInkTouch=!this.fingerInk||this.reading||this.tool==='hand';
+    this.touches.delete(pointerId);
+    if(this.touches.size<2){this.pinch=undefined;this.infinitePinch=undefined;}
+    if(!this.touches.size){
+      this.touchPinching=false;
+      if((wasPinching||nonInkTouch)&&(!this.gesture||this.gesture.pointer!==pointerId)){
+        if(this.infinite){this.persistViewport();this.drawFooter();}else{this.drawPages();this.drawFooter();}
+      }
+    }
+  }
   private pointerDown(e:PointerEvent,s:Surface){
     if(!this.valid||e.pointerType==='pen'&&!this.plugin.settings.penEnabled)return;
     rememberAnchor(null);
     this.lastPointerType=e.pointerType;
-    if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;this.infinitePinch=undefined;}
-    if(e.pointerType==='touch'&&(Date.now()-this.lastPen<700||this.gesture?.pointer!==undefined&&this.gesture.tool!=='hand'))return;
+    if(e.pointerType==='pen'){this.lastPen=Date.now();this.touches.clear();this.pinch=undefined;this.infinitePinch=undefined;this.touchPinching=false;}
+    const touchPinchCandidate=e.pointerType==='touch'&&this.fingerInk&&!this.reading&&this.tool!=='hand'&&this.gesture?.pointerType==='touch';
+    if(e.pointerType==='touch'&&(Date.now()-this.lastPen<700||!touchPinchCandidate&&this.gesture?.pointer!==undefined&&this.gesture.tool!=='hand'))return;
     const textPlacement=!this.reading&&(this.tool==='sticky'||this.tool==='text');
     e.preventDefault();s.ui.setPointerCapture(e.pointerId);this.activate(s);if(!textPlacement)this.root.focus({preventScroll:true});
     if(this.infinite&&(e.button===1||(e.buttons&4)!==0||this.spacePanning&&e.button===0)){
       this.middlePan={pointerId:e.pointerId,lastX:e.clientX,lastY:e.clientY};s.sheet.addClass('is-panning');return;
     }
-    if(e.pointerType==='touch'&&(!this.fingerInk||this.reading||this.tool==='hand')){
+    if(e.pointerType==='touch'){
+      if(!this.fingerInk||this.reading||this.tool==='hand'){
+        this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+        if(this.touches.size===2){this.touchPinching=true;this.startPinchFromTouches();}
+        return;
+      }
       this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
       if(this.touches.size===2){
-        const[a,b]=[...this.touches.values()];
-        const dist=Math.hypot(a.x-b.x,a.y-b.y);
-        if(this.infinite){
-          const r=this.stage.getBoundingClientRect();
-          this.infinitePinch={distance:dist,camera:{...this.camera},mid:[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top]};
-        }else{
-          this.pinch={distance:dist,zoom:this.zoom,cx:(a.x+b.x)/2,cy:(a.y+b.y)/2};
+        if(this.gesture?.pointerType==='touch'){
+          if(!isIncipientTouchGesture(this.gesture,this.zoom)){this.touches.delete(e.pointerId);return;}
+          this.finishGesture(false);
         }
+        this.touchPinching=true;
+        this.startPinchFromTouches();
+        return;
       }
-      return;
+      if(this.touches.size>2||this.touchPinching)return;
     }
     if(this.gesture){if(this.gesture.pointerType===e.pointerType)return;this.finishGesture(true);}const pt=this.point(e,s);let tool=this.reading?'hand':this.tool;if(e.pointerType==='pen'&&(e.button===5||(e.buttons&32)!==0||e.button===2))tool='eraser';
     if(this.sampleColor){this.sampleColor=false;const canvas=document.createElement('canvas');canvas.width=canvas.height=1;const ctx=canvas.getContext('2d')!;
@@ -856,6 +935,10 @@ export class PenbookView extends TextFileView {
       const g=this.gesture,from=this.penHoldStart;
       if(!g||!from||g.ending)return;
       if(Math.hypot(g.last[0]-from[0],g.last[1]-from[1])>8/this.zoom)return;
+      if(this.shapeTimer!==undefined){window.clearTimeout(this.shapeTimer);this.shapeTimer=undefined;}
+      g.snapped=undefined;g.snappedBase=undefined;g.holdPoint=undefined;
+      g.penHoldBefore=this.tool;
+      this.penHoldStart=undefined;
       this.penHoldFired=true;
       this.penEraserBefore=this.tool;
       // 把当前这一笔原地转为橡皮擦手势，抬笔前即可直接擦除
@@ -870,26 +953,6 @@ export class PenbookView extends TextFileView {
     },700);
   }
   private cancelPenHold(){if(this.penHoldTimer!==undefined){window.clearTimeout(this.penHoldTimer);this.penHoldTimer=undefined;}this.penHoldStart=undefined;}
-  private eraseAt(g:Gesture,pt:Point){
-    const page=g.surface.page,before=this.snapshot(),radius=this.eraserSize;
-    const x=pt[0]-radius,y=pt[1]-radius,right=pt[0]+radius,bottom=pt[1]+radius;
-    const intersects=(o:Item)=>{const a=o.rotation*Math.PI/180,rw=(Math.abs(o.w*Math.cos(a))+Math.abs(o.h*Math.sin(a)))/2,rh=(Math.abs(o.w*Math.sin(a))+Math.abs(o.h*Math.cos(a)))/2,cx=o.x+o.w/2,cy=o.y+o.h/2,pad=(o.width??3)*8;return cx+rw+pad>=x&&cx-rw-pad<=right&&cy+rh+pad>=y&&cy-rh-pad<=bottom;};
-    const hits=page.items.filter(o=>!o.locked&&o.kind==='stroke'&&(this.plugin.settings.eraserOnly!=='highlighter'||o.pen==='highlighter')&&intersects(o));
-    if(!hits.length){new Notice('笔尖附近没有可擦除的笔迹');return;}
-    if(this.plugin.settings.eraser==='stroke'){
-      const ids=new Set(hits.map(o=>o.id));
-      page.items=page.items.filter(o=>!ids.has(o.id));
-      this.changed(before);this.repaint();this.updateSelectionBar();new Notice('已擦除 '+ids.size+' 条笔迹');return;
-    }
-    const items=hits.map(item=>({item,outline:this.renderer.strokeOutline(item)}));
-    const segments=[{from:pt as Point,to:[pt[0]+0.01,pt[1]+0.01,pt[2]] as Point}];
-    void this.backgroundEraser.execute({session:uid(),items,segments,radius,standard:this.plugin.settings.eraserPrecision==='standard',whole:false}).then(result=>{
-      if(!result.changes.length){new Notice('笔尖附近没有可擦除的笔迹');return;}
-      const changes=new Map(result.changes.map(c=>[c.id,c.items]));
-      page.items=page.items.flatMap(o=>{const r=changes.get(o.id);if(!r)return[o];return r.map(({item,clip})=>{this.renderer.cacheClip(item,clip);return item;});});
-      this.changed(before);this.repaint();this.updateSelectionBar();new Notice('已擦除');
-    }).catch(error=>{console.error('Penbook',error);new Notice('擦除失败：'+String(error));});
-  }
   private pointerMove(e:PointerEvent,s:Surface){
     if(e.pointerType==='pen')this.lastPen=Date.now();
     if(this.middlePan?.pointerId===e.pointerId){
@@ -901,21 +964,25 @@ export class PenbookView extends TextFileView {
     }
     if(e.pointerType!=='touch'){this.hover={surface:s,point:this.point(e,s)};const f=this.tool==='lasso'&&s.page===this.page?this.selectionFrame():null,hit=f?this.selectionHit(this.hover.point,f):undefined;s.ui.style.cursor=this.tool==='lasso'?(hit==='resize'?'nwse-resize':hit==='rotate'?'grab':hit==='move'?'move':'default'):'';if(!this.gesture)this.queuePreview(()=>{if(!this.gesture&&this.hover?.surface===s)this.paintUI(s,undefined,undefined,this.hover.point);});}
     if(this.touches.has(e.pointerId)){
-      e.preventDefault();const old=this.touches.get(e.pointerId)!;this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
-      if(this.infinite){
-        if(this.touches.size===1){
-          const dx=e.clientX-old.x,dy=e.clientY-old.y;
-          this.setInfiniteCamera({...this.camera,x:this.camera.x-dx/this.camera.zoom,y:this.camera.y-dy/this.camera.zoom});
-        }else if(this.infinitePinch&&this.touches.size>=2){
-          const[a,b]=[...this.touches.values()],r=this.stage.getBoundingClientRect();
-          const currMid:[number,number]=[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top],currDist=Math.hypot(a.x-b.x,a.y-b.y);
-          this.setInfiniteCamera(pinchTransform(this.infinitePinch.camera,this.infinitePinch.mid,this.infinitePinch.distance,currMid,currDist,this.stageSize()));
+      const old=this.touches.get(e.pointerId)!;this.touches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+      const pinchingOrPan=!this.fingerInk||this.reading||this.tool==='hand'||this.touchPinching||this.touches.size>=2;
+      if(pinchingOrPan){
+        e.preventDefault();
+        if(this.infinite){
+          if(this.touches.size===1){
+            const dx=e.clientX-old.x,dy=e.clientY-old.y;
+            this.setInfiniteCamera({...this.camera,x:this.camera.x-dx/this.camera.zoom,y:this.camera.y-dy/this.camera.zoom});
+          }else if(this.infinitePinch&&this.touches.size>=2){
+            const[a,b]=[...this.touches.values()],r=this.stage.getBoundingClientRect();
+            const currMid:[number,number]=[(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top],currDist=Math.hypot(a.x-b.x,a.y-b.y);
+            this.setInfiniteCamera(pinchTransform(this.infinitePinch.camera,this.infinitePinch.mid,this.infinitePinch.distance,currMid,currDist,this.stageSize()));
+          }
+          return;
         }
+        if(this.touches.size===1){this.stage.scrollLeft-=e.clientX-old.x;this.stage.scrollTop-=e.clientY-old.y;}
+        else if(this.pinch){const[a,b]=[...this.touches.values()];const next=Math.max(.15,Math.min(4,this.pinch.zoom*Math.hypot(a.x-b.x,a.y-b.y)/Math.max(1,this.pinch.distance)));const ratio=next/this.zoom;this.zoom=next;for(const surface of this.surfaces){surface.sheet.style.width=`${surface.page.width*next}px`;surface.sheet.style.height=`${surface.page.height*next}px`;}this.stage.scrollLeft=(this.stage.scrollLeft+this.stage.clientWidth/2)*ratio-this.stage.clientWidth/2;this.stage.scrollTop=(this.stage.scrollTop+this.stage.clientHeight/2)*ratio-this.stage.clientHeight/2;}
         return;
       }
-      if(this.touches.size===1){this.stage.scrollLeft-=e.clientX-old.x;this.stage.scrollTop-=e.clientY-old.y;}
-      else if(this.pinch){const[a,b]=[...this.touches.values()];const next=Math.max(.15,Math.min(4,this.pinch.zoom*Math.hypot(a.x-b.x,a.y-b.y)/Math.max(1,this.pinch.distance)));const ratio=next/this.zoom;this.zoom=next;for(const surface of this.surfaces){surface.sheet.style.width=`${surface.page.width*next}px`;surface.sheet.style.height=`${surface.page.height*next}px`;}this.stage.scrollLeft=(this.stage.scrollLeft+this.stage.clientWidth/2)*ratio-this.stage.clientWidth/2;this.stage.scrollTop=(this.stage.scrollTop+this.stage.clientHeight/2)*ratio-this.stage.clientHeight/2;}
-      return;
     }
     const g=this.gesture;if(!g||g.ending||g.pointer!==e.pointerId)return;e.preventDefault();
     if(g.tool==='hand'){
@@ -937,7 +1004,7 @@ export class PenbookView extends TextFileView {
         moveDx=snap.dx;moveDy=snap.dy;this.activeGuides=snap.guides;
       }else{this.activeGuides=[];}
       if(g.mode==='rotate')this.selectionAngle=f.angle+a;
-      for(const original of g.original){const o=g.surface.page.items.find(o=>o.id===original.id)!;if(g.mode==='move'){o.x=original.x+moveDx;o.y=original.y+moveDy;}else if(g.mode==='rotate'){const x=original.x+original.w/2-f.cx,y=original.y+original.h/2-f.cy;o.x=f.cx+x*Math.cos(a)-y*Math.sin(a)-original.w/2;o.y=f.cy+x*Math.sin(a)+y*Math.cos(a)-original.h/2;o.rotation=original.rotation+a*180/Math.PI;}else{const centerX=original.x+original.w/2-anchorX,centerY=original.y+original.h/2-anchorY,localX=centerX*c+centerY*s,localY=-centerX*s+centerY*c,oW=original.w*scaleX,oH=original.h*scaleY,scaledX=localX*scaleX,scaledY=localY*scaleY;o.w=oW;o.h=oH;o.x=anchorX+scaledX*c-scaledY*s-o.w/2;o.y=anchorY+scaledX*s+scaledY*c-o.h/2;if(original.kind==='shape'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.bw=o.w;o.bh=o.h;}else if(original.kind==='stroke'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.frozenInk=original.frozenInk?.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY]));o.eraseMasks=original.eraseMasks?.map(poly=>poly.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY])));o.bw=o.w;o.bh=o.h;}else if(original.kind==='sticky'||original.kind==='text'){o.bw=o.w;o.bh=o.h;}}}
+      for(const original of g.original){const o=g.surface.page.items.find(o=>o.id===original.id)!;if(g.mode==='move'){o.x=original.x+moveDx;o.y=original.y+moveDy;}else if(g.mode==='rotate'){const x=original.x+original.w/2-f.cx,y=original.y+original.h/2-f.cy;o.x=f.cx+x*Math.cos(a)-y*Math.sin(a)-original.w/2;o.y=f.cy+x*Math.sin(a)+y*Math.cos(a)-original.h/2;o.rotation=original.rotation+a*180/Math.PI;}else{const centerX=original.x+original.w/2-anchorX,centerY=original.y+original.h/2-anchorY,localX=centerX*c+centerY*s,localY=-centerX*s+centerY*c,oW=original.w*scaleX,oH=original.h*scaleY,scaledX=localX*scaleX,scaledY=localY*scaleY;o.w=oW;o.h=oH;o.x=anchorX+scaledX*c-scaledY*s-o.w/2;o.y=anchorY+scaledX*s+scaledY*c-o.h/2;if(original.kind==='shape'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.bw=o.w;o.bh=o.h;}else if(original.kind==='stroke'){o.points=original.points?.map(([x,y,p])=>[x*scaleX,y*scaleY,p]);o.frozenInk=original.frozenInk?.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY]));o.eraseMasks=original.eraseMasks?.map(poly=>poly.map(ring=>ring.map(([x,y])=>[x*scaleX,y*scaleY])));o.bw=o.w;o.bh=o.h;}else if(original.kind==='sticky'||original.kind==='text'||original.kind==='table'||original.kind==='link'){o.bw=o.w;o.bh=o.h;}}}
       updateBoundConnectors(g.surface.page.items,movingIds);
       g.last=pt;this.repaint();return;
     }
@@ -961,19 +1028,44 @@ export class PenbookView extends TextFileView {
   }
   private pointerUp(e:PointerEvent){
     if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;this.surfaces[0]?.sheet.removeClass('is-panning');this.persistViewport();return;}
-    if(this.touches.has(e.pointerId)){this.touches.delete(e.pointerId);if(this.touches.size<2){this.pinch=undefined;this.infinitePinch=undefined;}if(!this.touches.size){if(this.infinite){this.persistViewport();this.drawFooter();}else{this.drawPages();this.drawFooter();}}return;}
-        this.cancelPenHold();if(this.penHoldFired){this.penHoldFired=false;const back=this.penEraserBefore;this.penEraserBefore=undefined;if(back&&back!=='eraser')window.setTimeout(()=>{if(this.tool==='eraser')this.setTool(back);},0);}
+    if(this.touches.has(e.pointerId)){
+      const wasPinching=this.touchPinching,nonInkTouch=!this.fingerInk||this.reading||this.tool==='hand';
+      this.touches.delete(e.pointerId);
+      if(this.touches.size<2){this.pinch=undefined;this.infinitePinch=undefined;}
+      if(!this.touches.size)this.touchPinching=false;
+      if(wasPinching||nonInkTouch){
+        if(!this.touches.size){if(this.infinite){this.persistViewport();this.drawFooter();}else{this.drawPages();this.drawFooter();}}
+        return;
+      }
+    }
+    if(!this.gesture||this.gesture.pointer===e.pointerId)this.cancelPenHold();
     if(this.gesture?.pointer===e.pointerId){const g=this.gesture;const end=this.point(e,g.surface);if(g.tool==='eraser'&&!g.ending)this.queueErase(g,g.last,end);g.last=end;if(g.tool==='pen'&&Math.hypot(end[0]-g.points.at(-1)![0],end[1]-g.points.at(-1)![1])>.2)g.points.push(end);this.finishGesture(true);}
   }
-  private pointerCancel(e:PointerEvent){this.cancelPenHold();if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;this.surfaces[0]?.sheet.removeClass('is-panning');}this.touches.delete(e.pointerId);this.pinch=undefined;this.infinitePinch=undefined;const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}}
+  private pointerCancel(e:PointerEvent){
+    if(!this.gesture||this.gesture.pointer===e.pointerId)this.cancelPenHold();
+    if(this.middlePan?.pointerId===e.pointerId){this.middlePan=undefined;this.surfaces[0]?.sheet.removeClass('is-panning');}
+    if(this.touches.has(e.pointerId)){
+      const wasPinching=this.touchPinching,nonInkTouch=!this.fingerInk||this.reading||this.tool==='hand';
+      this.touches.delete(e.pointerId);
+      if(this.touches.size<2){this.pinch=undefined;this.infinitePinch=undefined;}
+      if(!this.touches.size){
+        this.touchPinching=false;
+        if((wasPinching||nonInkTouch)&&(!this.gesture||this.gesture.pointer!==e.pointerId)){
+          if(this.infinite){this.persistViewport();this.drawFooter();}else{this.drawPages();this.drawFooter();}
+        }
+      }
+    }
+    const g=this.gesture;if(g&&g.pointer===e.pointerId){const moved=Boolean(g.mode&&g.original&&g.original.length&&(Math.abs(g.last[0]-g.start[0])>1e-3||Math.abs(g.last[1]-g.start[1])>1e-3));this.finishGesture(moved);}
+  }
   private finishGesture(commit:boolean):void|Promise<void>{
     const current=this.gesture;
     if(current?.tool==='eraser'&&!current.finalized&&commit){return current.ending??(current.ending=this.finishEraser(current));}
     if(current?.tool==='eraser'&&!commit)this.backgroundEraser.stop();
-    if(this.shapeTimer!==undefined)window.clearTimeout(this.shapeTimer);this.shapeTimer=undefined;const g=this.gesture;if(!g)return;this.gesture=undefined;this.activeGuides=[];
-    if(g.tool==='hand'&&this.infinite){g.surface.sheet.removeClass('is-panning');this.persistViewport();return;}
-    if(g.tool==='laser'){if(this.laserTrail){if(commit){this.laserTrail.releasedAt=performance.now();this.animateLaser();}else this.laserTrail=undefined;}this.paintUI(g.surface);return;}
-    if(!commit){if(!g.before){this.paintUI(g.surface);return;}Object.assign(this.book,clone(g.before));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();if(this.valid&&this.root)this.render();return;}
+    if(this.shapeTimer!==undefined)window.clearTimeout(this.shapeTimer);this.shapeTimer=undefined;this.cancelPenHold();const g=this.gesture;if(!g)return;this.gesture=undefined;this.activeGuides=[];
+    const restorePenHold=()=>{if(g.penHoldBefore&&g.penHoldBefore!=='eraser'){this.penHoldFired=false;this.penEraserBefore=undefined;if(this.tool==='eraser')this.setTool(g.penHoldBefore);}};
+    if(g.tool==='hand'&&this.infinite){g.surface.sheet.removeClass('is-panning');this.persistViewport();restorePenHold();return;}
+    if(g.tool==='laser'){if(this.laserTrail){if(commit){this.laserTrail.releasedAt=performance.now();this.animateLaser();}else this.laserTrail=undefined;}this.paintUI(g.surface);restorePenHold();return;}
+    if(!commit){if(!g.before||(!g.mode&&!g.edited&&!g.erasedStrokes?.size)){this.paintUI(g.surface);restorePenHold();return;}Object.assign(this.book,clone(g.before));this.index=Math.min(this.index,this.book.pages.length-1);this.selection.clear();if(this.valid&&this.root)this.render();restorePenHold();return;}
     let edited=false;
     if(g.tool==='pen'){
       if(!g.snapped&&!this.ink.straight&&this.ink.scribbleToErase!==false&&isScribbleGesture(g.points,this.zoom)){
@@ -993,7 +1085,7 @@ export class PenbookView extends TextFileView {
       }
     }
     else if(g.tool==='tape'&&g.points.some(p=>Math.hypot(p[0]-g.start[0],p[1]-g.start[1])>3/this.zoom)){g.surface.page.items.push(this.makeTape(g));edited=true;}
-    else if(g.tool==='sticky'){this.hover=undefined;this.paintUI(g.surface);void this.run(()=>this.insertObject('sticky',g.last));return;}
+    else if(g.tool==='sticky'){this.hover=undefined;this.paintUI(g.surface);restorePenHold();void this.run(()=>this.insertObject('sticky',g.last));return;}
     else if(g.tool==='shape'&&g.points.length>1&&this.automaticShape){g.surface.page.items.push(g.snapped??this.autoShape(g)??this.inkStroke(g.points));edited=true;}
     else if(g.tool==='shape'&&!this.automaticShape&&Math.hypot(g.last[0]-g.start[0],g.last[1]-g.start[1])>2){g.surface.page.items.push(this.makeShape(g.start,g.last,g.lastMoved,g.surface.page.items));edited=true;}
     else if(g.mode){edited=Boolean(g.original?.some(b=>{const o=g.surface.page.items.find(x=>x.id===b.id);return o&&(Math.abs(o.x-b.x)>1e-3||Math.abs(o.y-b.y)>1e-3||Math.abs(o.w-b.w)>1e-3||Math.abs(o.h-b.h)>1e-3||Math.abs(o.rotation-b.rotation)>1e-3);}));}
@@ -1014,7 +1106,9 @@ export class PenbookView extends TextFileView {
         const groups=new Set(g.surface.page.items.filter(o=>this.selection.has(o.id)).map(o=>o.group).filter(Boolean));for(const o of g.surface.page.items)if(o.group&&groups.has(o.group))this.selection.add(o.id);
       }
     }
-    if(edited){this.changed(g.before);this.drawSidebar();}this.repaint();this.updateSelectionBar();if(g.tool==='eraser'&&this.plugin.settings.eraserAutoPrevious)this.setTool(this.previousTool);
+    if(edited){this.changed(g.before);this.drawSidebar();}this.repaint();this.updateSelectionBar();
+    if(g.penHoldBefore&&g.penHoldBefore!=='eraser')restorePenHold();
+    else if(g.tool==='eraser'&&this.plugin.settings.eraserAutoPrevious)this.setTool(this.previousTool);
   }
   private autoShape(g:Gesture){const o=recognizeShape(g.points,this.color,this.width);if(!o)return null;o.fill=this.ink.fill;o.strokeStyle=this.ink.style;o.opacity=this.pen==='highlighter'?.3:1;if(this.ink.alignShapes){for(const existing of g.surface.page.items.filter(o=>o.kind==='shape')){for(const x of[existing.x,existing.x+existing.w])if(Math.abs(o.x-x)<6/this.zoom)o.x=x;for(const y of[existing.y,existing.y+existing.h])if(Math.abs(o.y-y)<6/this.zoom)o.y=y;}}return o;}
   private scheduleShape(g:Gesture,pt:Point){
@@ -1366,7 +1460,10 @@ export class PenbookView extends TextFileView {
   }
   private async transferObjects(){const selected=this.page.items.filter(o=>this.selection.has(o.id));if(!selected.length)return;const options:Record<string,string>={};this.book.pages.forEach((p,i)=>{if(i!==this.index)options[p.id]=`${i+1}. ${p.title||'未命名页面'}`;});if(!Object.keys(options).length){new Notice('请先添加另一页');return;}const v=await form(this.app,'选区转移',[{key:'page',name:'目标页面',value:Object.keys(options)[0],options},{key:'mode',name:'操作',value:'copy',options:{copy:'复制',move:'移动'}}]);if(!v)return;const before=this.snapshot(),target=this.book.pages.find(p=>p.id===v.page)!;const copies=clone(selected);copies.forEach(o=>o.id=uid());target.items.push(...copies);if(v.mode==='move'){this.page.items=this.page.items.filter(o=>!this.selection.has(o.id)||o.locked);clearDanglingBindings(this.page.items);}this.selection.clear();this.changed(before);this.repaint();this.drawSidebar();}
   private pageUrl(path:string,id:string){return `obsidian://penbook?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(path)}&page=${id}`;}
-  private async transferPage(move:boolean){const book=this.book,page=this.page,sourcePath=this.file?.path??'',destination=await pickFile(this.app,f=>f.extension==='penbook'&&f.path!==sourcePath,'选择目标笔记本');if(!destination||this.book!==book||!book.pages.includes(page))return;let copiedId='';
+  private async transferPage(move:boolean){const book=this.book,page=this.page,sourcePath=this.file?.path??'',destination=await pickFile(this.app,f=>f.extension==='penbook'&&f.path!==sourcePath,'选择目标笔记本');if(!destination||this.book!==book||!book.pages.includes(page))return;
+    for(const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)){const view=leaf.view;if(view instanceof PenbookView&&view.file?.path===destination.path)await view.flushPending();}
+    if(this.closed||this.book!==book||!book.pages.includes(page))return;
+    let copiedId='';
     await this.app.vault.process(destination,data=>{const target=parseBook(data),[copied]=copyPages([page],book,target,id=>this.pageUrl(sourcePath,id));copiedId=copied.id;target.pages.push(copied);target.modified=new Date().toISOString();return JSON.stringify(target);});
     if(move&&this.book===book){const before=this.snapshot();book.pages.splice(book.pages.indexOf(page),1);for(const p of book.pages)for(const link of p.pdfLinks??[])if(link.page===page.id){link.url=this.pageUrl(destination.path,copiedId);delete link.page;}if(!book.pages.length)book.pages.push(newPage());this.index=Math.min(this.index,book.pages.length-1);this.changed(before);this.render();}new Notice(move?'页面已移动':'页面已复制');
   }

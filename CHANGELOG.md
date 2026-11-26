@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- **Sync Conflict Protection & Safe Flush**: Added `dirtyVersion` / `inFlightWrite` tracking in `PenbookView` to ignore vault echo writes, preserve local unsaved edits while saving remote sync conflicts to `.sync-conflict-<timestamp>.penbook` backups, and flush open destination leaves before `transferPage()`.
+- **0.7s Hold-to-Eraser Race & Interrupt Fix**: Cleared active shape timers/snapped state when hold-to-eraser triggers, scoped `cancelPenHold()` to the active pointer, removed the racy `setTimeout(..., 0)` tool restore, and restored `penHoldBefore` consistently on both commit and cancel/interrupt.
+- **Infinite Canvas Eraser Clip & Table/Link Resize**: Added `infiniteEraserClipRegion()` 2px screen-space padding in `repaintEraserRegion()` to prevent anti-aliased stroke edge artifacts, and updated `bw`/`bh` during `table` and `link` resize gestures.
+- **PDF Underline / StrikeOut / Squiggly Rendering**: Canonicalized imported PDF `quadPoints` to prevent bowties and rendered `Underline`, `StrikeOut`, and `Squiggly` markups as stroked paths across Canvas, SVG export, and PDF appearance streams while keeping `Highlight` as `multiply`-blended filled quads.
+- **Stylus Zero-Pressure, `fingerInk` Pinch & Incremental Library Cache**: Mapped `mouse` zero-pressure to `0.5` while keeping pen/touch `0` at minimum `0.05^gamma`, allowed 2-finger pinch zoom to cancel incipient touch strokes in `fingerInk` mode, and added an `mtime`/`size`-cached `LibraryIndex` (`library-index.json`) to avoid re-parsing unchanged notebooks.
+
 ## 0.5.0
 
 - **Pen Favorites Dock (A1)**: Added up to 6 customizable quick-switch pen presets in the context bar with persistent settings and long-press/right-click slot management.

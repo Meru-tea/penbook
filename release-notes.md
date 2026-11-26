@@ -1,23 +1,29 @@
-# Penbook 0.3.1
+# Penbook 0.5.0
 
-This maintenance release fixes the current Obsidian community review errors. It also aligns the published manifest with the existing directory name and description format. The automated PDF and regression checks listed below pass. Obsidian UI verification remains separate.
+Penbook 0.5.0 introduces five major writing, diagramming, search, and Obsidian integration upgrades on top of Infinite Canvas (0.4.0):
 
-This release expands standard PDF annotation round-tripping and includes all features from 0.2.0, including embedded PDFs, editable tables, cross-notebook selection copy/cut, vector object SVG export, bookmarks, links, and page cropping.
+## Highlights
 
-Native annotation types and appearances are retained, including stamps, caret annotations, file attachments, text markup, polygons, polylines, and complex annotation data. You can select, move, resize, rotate, copy, delete, and edit their comments. FreeText edits update the visible appearance and retain font size/color. Embedded attachment bytes, popup/reply relationships, and form values are covered by regression tests.
-
-Complex annotations retain their original data and preview. Media playback, 3D interaction, form filling, digital signing, and applying redactions are not added by this release. Obsidian UI verification remains separate from the automated PDF tests.
+- **Pen Favorites Dock (A1)**: Save up to 6 pen presets (pen type, color, width, stroke style) in the context toolbar for one-tap switching, with long-press / right-click editing.
+- **Scribble-to-Erase & Smart Shape Connectors (A2)**:
+  - Scratch back-and-forth over ink strokes to erase them (toggleable in pen settings, undoable).
+  - Keep dragging after auto-shape snap to adjust endpoints or dimensions smoothly.
+  - Snap lines and arrows onto shape anchors with straight, orthogonal elbow, or curved routes that stay attached when shapes move, resize, rotate, align, or flip.
+  - Double-click closed shapes to edit centered labels.
+- **Marquee Selection, Smart Guides & Selection Tools (A3)**:
+  - Switch between freehand lasso and rectangular marquee selection.
+  - Smart edge/center alignment guides and optional grid snap while moving selections.
+  - Align & distribute (8 modes), horizontal/vertical flip, and filter selection by object type.
+- **In-Document PDF & Notebook Full-Text Search (B1)**:
+  - Press `Ctrl/Cmd+F` to search PDF text (preserving rotation and crop coordinates) as well as text boxes, sticky notes, tables, and shape labels across paged and infinite notebooks, with on-canvas match highlights and next/previous navigation.
+- **Native Live Wikilink Embeds (C1)**:
+  - Embed notebooks, pages, or infinite viewport bookmarks directly with `![[Notebook.penbook#pageOrBookmark]]` in Reading View, Live Preview, and Obsidian Canvas, with `mtime`-cached rendering and automatic refresh on save.
 
 ## Installation
 
-Download **penbook.zip**, extract the `penbook` folder, and copy its contents into your vault's `.obsidian/plugins/penbook/` folder. Keep the `cmaps`, `standard_fonts`, `wasm`, and `licenses` directories. Reload Penbook in Obsidian.
-
-The separate `main.js`, `manifest.json`, and `styles.css` assets are also provided. The ZIP is the complete installation package, including local PDF resources and licenses. `SHA256SUMS.txt` contains checksums for these downloads.
+Download **penbook.zip**, extract the `penbook` folder, and copy its contents into your vault's `.obsidian/plugins/penbook/` folder (preserving `cmaps`, `standard_fonts`, `wasm`, and `licenses`), or update `main.js`, `manifest.json`, and `styles.css` directly (compatible with BRAT). Reload Penbook in Obsidian.
 
 ## Validation
 
-- 26 annotation subtypes at 0°, 90°, 180°, and 270°, plus native links and popup annotations.
-- Appearance comparisons, embedded attachment bytes, replies, hidden fields, radio groups, deletion, edited FreeText, and rotated/resized cross-notebook copies.
-- 72 eraser pixel cases, geometry holes, split strokes, save/reload, shortcut and save lifecycle regressions.
-- A 151 MB PDF saved entirely inside a notebook, reopened without its original file, checked for byte equality, and exported.
-- Bundled PDF.js 6.4.299; production dependency audit reports no known vulnerabilities.
+- `npm run build` (`tsc --noEmit && node build.mjs`) passes cleanly.
+- Automated regression checks pass: `check-a1-a3.mjs`, `check-a2.mjs`, `check-b1.mjs`, `check-c1.mjs`, `check-infinite.mjs`, `check-shortcuts.mjs`, and `check-erasure-regression.mjs`.

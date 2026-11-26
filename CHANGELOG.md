@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- **Pen Favorites Dock (A1)**: Added up to 6 customizable quick-switch pen presets in the context bar with persistent settings and long-press/right-click slot management.
+- **Scribble-to-Erase, Hold-to-Adjust Shapes & Bound Connectors (A2)**: Added back-and-forth scribble stroke erasing, continuous post-snap shape adjustment while holding the pen, shape anchor snapping with straight/elbow/curved bound connectors that follow shape transforms, and double-click centered text labels inside closed shapes.
+- **Rectangular Marquee, Smart Guides & Selection Tools (A3)**: Added lasso/marquee selection toggle, grid snap and smart edge/center alignment guides while dragging, 8-way align/distribute, horizontal/vertical flip, and selection filtering by object kind.
+- **In-Document Full-Text Search (B1)**: Added `Ctrl/Cmd+F` floating search bar supporting PDF text coordinates (with rotation and crop support) and canvas text/sticky/table/shape items across paged and infinite notebooks with match highlighting and navigation.
+- **Native Live Embeds (C1)**: Added `![[Notebook.penbook#pageOrBookmark]]` live embed rendering in Markdown Reading View, Live Preview, and Obsidian Canvas with `mtime`-keyed LRU caching, auto-refresh on file modification, upgraded `penbook` codeblocks, and one-click embed link copying.
+
 ## 0.3.1
 
 - Use Obsidian's settings heading and CSS APIs to satisfy current community review checks.
